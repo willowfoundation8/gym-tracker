@@ -11,7 +11,7 @@ export async function onRequestPost({ request, env }) {
         'x-api-key': env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, messages }),
     });
     const text = await upstream.text();
     return new Response(text, {
