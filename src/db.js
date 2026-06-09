@@ -1,5 +1,6 @@
 // src/db.js — data layer backed by Dexie (IndexedDB).
 // v2: adds modalities table for learned exercise modality cache.
+// Phase 2: export/import for backup (JSON) and analysis (CSV).
 
 import Dexie from 'dexie';
 
@@ -59,13 +60,15 @@ export async function deleteWorkout(id) {
 }
 
 // ── Exercise rollups ─────────────────────────────────────────────────────────
+// Names ordered by most-recent use (class programming repeats — recency beats
+// the alphabet for the progress picker).
 export async function getExerciseNames() {
-  const all  = await db.workouts.toArray();
+  const all = (await db.workouts.toArray()).sort((a, b) => new Date(b.date) - new Date(a.date));
   const seen = new Map();
   all.forEach((w) => (w.exercises || []).forEach((e) => {
     if (!seen.has(e.nameKey)) seen.set(e.nameKey, e.name);
   }));
-  return [...seen.values()].sort();
+  return [...seen.values()];
 }
 
 // Kept for backwards compatibility — App.jsx no longer calls this directly
@@ -98,7 +101,8 @@ export async function learnAbbrev(entries) {
 }
 
 // ── Learned modalities ───────────────────────────────────────────────────────
-// { key: nameKey(exerciseName), modality: 'strength'|'bodyweight'|'distance'|'duration'|'cardio' }
+// { key: nameKey(exerciseName), modality } — ALL final modalities are learned,
+// including 'strength', so a user correction overwrites a stale wrong entry.
 export async function getModalityMap() {
   const rows = await db.modalities.toArray();
   const map  = {};
@@ -111,4 +115,65 @@ export async function learnModality(entries) {
     .map(({ name, modality }) => ({ key: nameKey(name), modality }))
     .filter((r) => r.key && r.modality);
   if (rows.length) await db.modalities.bulkPut(rows);
+}
+
+/* ===========================================================================
+   EXPORT / IMPORT — Phase 2 data safety.
+   JSON = full-fidelity backup of all three tables (restore via importAll).
+   CSV  = one row per set, for spreadsheets.
+=========================================================================== */
+export async function exportAll() {
+  const [workouts, abbrevs, modalities] = await Promise.all([
+    db.workouts.toArray(), db.abbrevs.toArray(), db.modalities.toArray(),
+  ]);
+  return { app: 'GymTracker', schemaVersion: 2, exportedAt: now(), workouts, abbrevs, modalities };
+}
+
+// Merge semantics: bulkPut upserts by primary key. Existing records with the
+// same id/key are overwritten by the backup; everything else is untouched.
+// Returns counts so the UI can report what happened.
+export async function importAll(data) {
+  if (!data || data.app !== 'GymTracker' || !Array.isArray(data.workouts)) {
+    throw new Error('Not a GymTracker backup file');
+  }
+  const workouts   = data.workouts.filter((w) => w && w.id);
+  const abbrevs    = (data.abbrevs    || []).filter((r) => r && r.key);
+  const modalities = (data.modalities || []).filter((r) => r && r.key);
+  await db.transaction('rw', db.workouts, db.abbrevs, db.modalities, async () => {
+    if (workouts.length)   await db.workouts.bulkPut(workouts);
+    if (abbrevs.length)    await db.abbrevs.bulkPut(abbrevs);
+    if (modalities.length) await db.modalities.bulkPut(modalities);
+  });
+  return { workouts: workouts.length, abbrevs: abbrevs.length, modalities: modalities.length };
+}
+
+// Pure CSV builder (exported for testability).
+const CSV_HEADERS = ['date', 'startTime', 'workoutType', 'className', 'exercise', 'modality',
+  'setIndex', 'reps', 'weight', 'weightUnit', 'distance', 'distUnit', 'seconds', 'resistance', 'height', 'heightUnit'];
+
+function csvField(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+export function workoutsToCSV(workouts) {
+  const rows = [CSV_HEADERS.join(',')];
+  for (const w of workouts) {
+    const date = (w.date || '').slice(0, 10);
+    for (const ex of (w.exercises || [])) {
+      (ex.sets || []).forEach((s, i) => {
+        rows.push([
+          date, w.startTime, w.workoutType, w.className, ex.name, ex.modality || 'strength',
+          i + 1, s.reps, s.weight, s.weightUnit, s.distance, s.distUnit, s.seconds, s.resistance, s.height, s.heightUnit,
+        ].map(csvField).join(','));
+      });
+    }
+  }
+  return rows.join('\n');
+}
+
+export async function exportCSV() {
+  const ws = (await db.workouts.toArray()).sort((a, b) => new Date(a.date) - new Date(b.date));
+  return workoutsToCSV(ws);
 }
