@@ -17,32 +17,53 @@ import {
    MODALITY — seed dictionary + helpers
    Lookup order: seed dict → learned store → AI suggestion → 'strength'
 =========================================================================== */
-const MODALITIES = ['strength', 'bodyweight', 'distance', 'duration', 'cardio'];
+const MODALITIES = ['strength', 'bodyweight', 'distance', 'loaded_distance', 'duration', 'cardio'];
 
 const MODALITY_LABELS = {
-  strength:   '🏋 Strength',
-  bodyweight: '💪 Bodyweight',
-  distance:   '📏 Distance',
-  duration:   '⏱ Duration',
-  cardio:     '🚣 Cardio',
+  strength:        '🏋 Strength',
+  bodyweight:      '💪 Bodyweight',
+  distance:        '📏 Distance',
+  loaded_distance: '🛷 Loaded Carry',
+  duration:        '⏱ Duration',
+  cardio:          '🚣 Cardio',
 };
+
+// Loaded-distance sub-type: sleds log TOTAL weight, carries log PER-HAND weight.
+// Display-only — drives the hint text and input placeholder, never the metric.
+const SLED_KEYWORDS = ['sled', 'prowler'];
+function isSledType(name) {
+  const k = (name || '').toLowerCase();
+  return SLED_KEYWORDS.some((w) => k.includes(w));
+}
 
 // Canonical exercise name (post-expansion, lower-trimmed) → modality
 const MODALITY_SEED = {
-  // ── Distance ──────────────────────────────────────────────────────────────
-  'sled push':             'distance',
-  'sled pull':             'distance',
-  'farmers carry':         'distance',
-  'farmers walk':          'distance',
-  'waiters walk':          'distance',
-  'waiter carry':          'distance',
-  'prowler push':          'distance',
-  'sandbag carry':         'distance',
-  'bear crawl':            'distance',
+  // ── Distance (unloaded) ─────────────────────────────────────────────────────
   'sprint':                'distance',
   'run':                   'distance',
   'treadmill run':         'distance',
   'treadmill sprint':      'distance',
+  // ── Loaded distance (weight × distance) ─────────────────────────────────────
+  'sled push':             'loaded_distance',
+  'sled pull':             'loaded_distance',
+  'prowler push':          'loaded_distance',
+  'prowler pull':          'loaded_distance',
+  'farmers carry':         'loaded_distance',
+  'farmers walk':          'loaded_distance',
+  'farmers hold':          'loaded_distance',
+  'waiters walk':          'loaded_distance',
+  'waiter carry':          'loaded_distance',
+  'suitcase carry':        'loaded_distance',
+  'suitcase walk':         'loaded_distance',
+  'sandbag carry':         'loaded_distance',
+  'dumbbell walk':         'loaded_distance',
+  'db walk':               'loaded_distance',
+  'kettlebell walk':       'loaded_distance',
+  'kb walk':               'loaded_distance',
+  'plate carry':           'loaded_distance',
+  'plate walk':            'loaded_distance',
+  'overhead carry':        'loaded_distance',
+  'yoke walk':             'loaded_distance',
   // ── Duration ──────────────────────────────────────────────────────────────
   'plank':                 'duration',
   'side plank':            'duration',
@@ -79,6 +100,7 @@ const MODALITY_SEED = {
   'air squat':             'bodyweight',
   'inchworm':              'bodyweight',
   'bear crawl':            'bodyweight',
+  'crab walk':             'bodyweight',
   // ── Cardio (machine-based) ────────────────────────────────────────────────
   'row':                   'cardio',
   'rowing':                'cardio',
@@ -110,8 +132,9 @@ function emptySet(modality, ref) {
   const distUnit = ref?.distUnit || 'm';
   switch (modality) {
     case 'bodyweight': return { reps: null, weight: null, weightUnit: unit };
-    case 'distance':   return { distance: null, distUnit };
-    case 'duration':   return { seconds: null };
+    case 'distance':        return { distance: null, distUnit };
+    case 'loaded_distance': return { weight: null, weightUnit: unit, distance: null, distUnit };
+    case 'duration':        return { seconds: null };
     case 'cardio':     return { distance: null, distUnit, seconds: null, resistance: 5 };
     default:           return { reps: null, weight: null, weightUnit: unit };  // strength
   }
@@ -161,10 +184,12 @@ async function extractExercises(base64) {
     '- "5km Run" -> {"name":"Run","suggestedDistance":5,"suggestedDistUnit":"km","modality":"distance"}\n' +
     '- "500m Row" -> {"name":"Row","suggestedDistance":500,"suggestedDistUnit":"m","modality":"cardio"}\n' +
     '- "30s Plank" -> {"name":"Plank","suggestedSeconds":30,"modality":"duration"}\n' +
-    '- "3x10 Squat" -> {"name":"Squat","suggestedSets":3,"suggestedReps":10,"modality":"strength"}\n\n' +
-    'Modality: "strength" (weighted reps), "bodyweight" (reps, no load), "distance" (sled, carry, run), "duration" (plank, holds), "cardio" (rower, ski erg, bike). Default "strength" if unsure.\n\n' +
+    '- "3x10 Squat" -> {"name":"Squat","suggestedSets":3,"suggestedReps":10,"modality":"strength"}\n' +
+    '- "Sled Push 100kg x 20m" -> {"name":"Sled Push","suggestedWeight":100,"suggestedWeightUnit":"kg","suggestedDistance":20,"suggestedDistUnit":"m","modality":"loaded_distance"}\n' +
+    '- "Farmers Carry 24kg / 40m" -> {"name":"Farmers Carry","suggestedWeight":24,"suggestedWeightUnit":"kg","suggestedDistance":40,"suggestedDistUnit":"m","modality":"loaded_distance"}\n\n' +
+    'Modality: "strength" (weighted reps), "bodyweight" (reps, no load), "distance" (unloaded run/sprint), "loaded_distance" (sled push/pull, prowler, farmers/waiters/suitcase carry, weighted walks — weight AND distance), "duration" (plank, holds), "cardio" (rower, ski erg, bike). Default "strength" if unsure.\n\n' +
     'Respond with ONLY a JSON array, no prose, no markdown fences. Each item:\n' +
-    '{"name":string,"suggestedSets":number|null,"suggestedReps":number|null,"suggestedDistance":number|null,"suggestedDistUnit":"m"|"km"|null,"suggestedSeconds":number|null,"suggestedHeight":number|null,"suggestedHeightUnit":"in"|"cm"|null,"modality":string}\n' +
+    '{"name":string,"suggestedSets":number|null,"suggestedReps":number|null,"suggestedWeight":number|null,"suggestedWeightUnit":"kg"|"lb"|null,"suggestedDistance":number|null,"suggestedDistUnit":"m"|"km"|null,"suggestedSeconds":number|null,"suggestedHeight":number|null,"suggestedHeightUnit":"in"|"cm"|null,"modality":string}\n' +
     'Use null for anything not shown. Preserve board order.';
   const res = await fetch('/api/vision', {
     method: 'POST',
@@ -183,6 +208,8 @@ async function extractExercises(base64) {
     raw:                 stripPrescription((x.name || 'Exercise').trim()),
     suggestedSets:       x.suggestedSets ?? null,
     suggestedReps:       x.suggestedReps ?? null,
+    suggestedWeight:     x.suggestedWeight ?? null,
+    suggestedWeightUnit: (x.suggestedWeightUnit === 'lb' || x.suggestedWeightUnit === 'kg') ? x.suggestedWeightUnit : null,
     suggestedDistance:   x.suggestedDistance ?? null,
     suggestedDistUnit:   (x.suggestedDistUnit === 'km' || x.suggestedDistUnit === 'm') ? x.suggestedDistUnit : null,
     suggestedSeconds:    x.suggestedSeconds ?? null,
@@ -291,7 +318,7 @@ function computeProgressData(workouts, exerciseName) {
         volume: Math.round(volume),
         topWeight, totalReps,
         totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.weight, reps: s.reps, z: s.reps })),
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'strength', weight: s.weight, reps: s.reps, z: s.reps })),
       });
 
     } else if (modality === 'bodyweight') {
@@ -300,7 +327,7 @@ function computeProgressData(workouts, exerciseName) {
       const maxReps   = Math.max(...valid.map((s) => s.reps));
       const totalReps = valid.reduce((sum, s) => sum + s.reps, 0);
       sessions.push({ ...base, maxReps, totalReps, totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.reps, reps: s.reps, z: s.reps })) });
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'bodyweight', weight: s.reps, reps: s.reps, z: s.reps })) });
 
     } else if (modality === 'distance') {
       const valid = sets.filter((s) => s.distance > 0);
@@ -308,7 +335,17 @@ function computeProgressData(workouts, exerciseName) {
       const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
       const bestDist  = Math.max(...valid.map((s) => s.distance));
       sessions.push({ ...base, totalDist, bestDist, totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.distance, reps: 1, z: 20 })) });
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'distance', weight: s.distance, unit: s.distUnit, reps: 1, z: 20 })) });
+
+    } else if (modality === 'loaded_distance') {
+      // Work = load × distance (kg·m). Rises if you push more weight OR further.
+      const valid = sets.filter((s) => s.weight > 0 && s.distance > 0);
+      if (!valid.length) continue;
+      const bestWork  = valid.reduce((b, s) => Math.max(b, s.weight * s.distance), 0);
+      const topWeight = Math.max(...valid.map((s) => s.weight));
+      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
+      sessions.push({ ...base, work: Math.round(bestWork), topWeight, totalDist, totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'loaded_distance', weight: s.weight, dist: s.distance, unit: s.distUnit, reps: s.distance, z: Math.max(20, s.distance) })) });
 
     } else if (modality === 'duration') {
       const valid = sets.filter((s) => s.seconds > 0);
@@ -316,7 +353,7 @@ function computeProgressData(workouts, exerciseName) {
       const bestSeconds = Math.max(...valid.map((s) => s.seconds));
       const totalSeconds = valid.reduce((sum, s) => sum + s.seconds, 0);
       sessions.push({ ...base, bestSeconds, totalSeconds, totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.seconds, reps: 1, z: 20 })) });
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'duration', weight: s.seconds, reps: 1, z: 20 })) });
 
     } else if (modality === 'cardio') {
       // Effort score: (distance / time_s) × (1 + resistance / 20)
@@ -332,8 +369,8 @@ function computeProgressData(workouts, exerciseName) {
         effort: Math.round(bestEffort * 1000) / 1000,
         totalDist, totalSets: valid.length,
         scatterSets: valid.map((s) => ({
-          date: w.date, label,
-          weight: s.distance,
+          date: w.date, label, mod: 'cardio',
+          weight: s.distance, unit: s.distUnit,
           reps: s.resistance || 0,
           z: Math.max(20, (s.resistance || 0) * 20),
         })),
@@ -359,6 +396,7 @@ function CombinedTooltip({ active, payload, label }) {
       {mod === 'strength'   && <><div style={{ color: '#d7ff32'  }}>e1RM: <b>{d.e1rm} kg</b></div><div style={{ color: '#6b9fff' }}>Volume: <b>{d.volume} kg</b></div></>}
       {mod === 'bodyweight' && <><div style={{ color: '#d7ff32'  }}>Max reps: <b>{d.maxReps}</b></div><div style={{ color: '#6b9fff' }}>Total reps: <b>{d.totalReps}</b></div></>}
       {mod === 'distance'   && <><div style={{ color: '#d7ff32'  }}>Best set: <b>{d.bestDist} m</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{d.totalDist} m</b></div></>}
+      {mod === 'loaded_distance' && <><div style={{ color: '#d7ff32'  }}>Work: <b>{d.work} kg·m</b></div><div style={{ color: '#6b9fff' }}>Best load: <b>{d.topWeight} kg</b></div></>}
       {mod === 'duration'   && <><div style={{ color: '#d7ff32'  }}>Best hold: <b>{fmtSeconds(d.bestSeconds)}</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{fmtSeconds(d.totalSeconds)}</b></div></>}
       {mod === 'cardio'     && <><div style={{ color: '#d7ff32'  }}>Effort score: <b>{d.effort}</b></div><div style={{ color: '#6b9fff' }}>Distance: <b>{d.totalDist} m</b></div></>}
       <div style={{ color: '#8b909c', marginTop: 4, borderTop: '1px solid #2a2e38', paddingTop: 4 }}>{d.totalSets} set{d.totalSets !== 1 ? 's' : ''}</div>
@@ -370,11 +408,16 @@ function ScatterTooltip({ active, payload }) {
   if (!active || !payload?.length) return null;
   const d = payload[0]?.payload;
   if (!d) return null;
+  const mod = d.mod || 'strength';
   return (
     <div style={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, padding: '10px 13px', fontSize: 12, lineHeight: 1.8 }}>
       <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
-      <div style={{ color: '#e7e9ee' }}>{d.weight} × {d.reps}</div>
-      {d.reps > 0 && d.weight > 0 && <div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div>}
+      {mod === 'strength'        && <><div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.reps} reps</div><div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div></>}
+      {mod === 'bodyweight'      && <div style={{ color: '#e7e9ee' }}>{d.reps} reps</div>}
+      {mod === 'distance'        && <div style={{ color: '#e7e9ee' }}>{d.weight} {d.unit || 'm'}</div>}
+      {mod === 'loaded_distance' && <div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.dist} {d.unit || 'm'}</div>}
+      {mod === 'duration'        && <div style={{ color: '#e7e9ee' }}>{fmtSeconds(d.weight)}</div>}
+      {mod === 'cardio'          && <div style={{ color: '#e7e9ee' }}>{d.weight} {d.unit || 'm'} · resist {d.reps}</div>}
     </div>
   );
 }
@@ -383,11 +426,12 @@ function ScatterTooltip({ active, payload }) {
    CHART METRIC CONFIG per modality
 =========================================================================== */
 const CHART_CONFIG = {
-  strength:   { primary: 'e1rm',       primaryLabel: 'e1RM (kg)',     secondary: 'volume',      secondaryLabel: 'Volume (kg)',  note: 'e1RM normalises any set to a "max effort" number — heavy singles and volume sets become comparable.' },
-  bodyweight: { primary: 'maxReps',    primaryLabel: 'Max reps',      secondary: 'totalReps',   secondaryLabel: 'Total reps',   note: 'Max reps is the best single set. Total reps shows overall volume done that session.' },
-  distance:   { primary: 'bestDist',   primaryLabel: 'Best set (m)',  secondary: 'totalDist',   secondaryLabel: 'Total dist (m)', note: 'Best set distance per session. Total shows cumulative work done.' },
-  duration:   { primary: 'bestSeconds',primaryLabel: 'Best hold (s)', secondary: 'totalSeconds',secondaryLabel: 'Total (s)',     note: 'Best single hold duration per session in seconds.' },
-  cardio:     { primary: 'effort',     primaryLabel: 'Effort score',  secondary: 'totalDist',   secondaryLabel: 'Distance (m)', note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },
+  strength:        { primary: 'e1rm',        primaryLabel: 'e1RM (kg)',    primaryUnit: 'kg', secondary: 'volume',       secondaryLabel: 'Volume (kg)',    secondaryUnit: 'kg', note: 'e1RM normalises any set to a "max effort" number — heavy singles and volume sets become comparable.' },
+  bodyweight:      { primary: 'maxReps',     primaryLabel: 'Max reps',     primaryUnit: '',   secondary: 'totalReps',    secondaryLabel: 'Total reps',     secondaryUnit: '',   note: 'Max reps is the best single set. Total reps shows overall volume done that session.' },
+  distance:        { primary: 'bestDist',    primaryLabel: 'Best set (m)', primaryUnit: 'm',  secondary: 'totalDist',    secondaryLabel: 'Total dist (m)', secondaryUnit: 'm',  note: 'Best set distance per session. Total shows cumulative distance covered.' },
+  loaded_distance: { primary: 'work',        primaryLabel: 'Work (kg·m)',  primaryUnit: '',   secondary: 'topWeight',    secondaryLabel: 'Best load (kg)', secondaryUnit: 'kg', note: 'Work = load × distance. The load bar shows whether progression came from heavier weight or more distance.' },
+  duration:        { primary: 'bestSeconds', primaryLabel: 'Best hold',    primaryUnit: '',   secondary: 'totalSeconds', secondaryLabel: 'Total (s)',      secondaryUnit: 's',  note: 'Best single hold duration per session.' },
+  cardio:          { primary: 'effort',      primaryLabel: 'Effort score', primaryUnit: '',   secondary: 'totalDist',    secondaryLabel: 'Distance (m)',   secondaryUnit: 'm',  note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },
 };
 
 /* ===========================================================================
@@ -429,6 +473,18 @@ function SetRowDistance({ s, onUpdate, num, parseNum }) {
   return (
     <>
       <input style={{ ...S.setInput, flex: 2 }} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
+    </>
+  );
+}
+
+function SetRowLoadedDistance({ s, onUpdate, num, parseNum, sled }) {
+  // weight × distance. Placeholder hints total (sled) vs per-hand (carry).
+  return (
+    <>
+      <input style={S.setInput} type="number" inputMode="decimal" placeholder={sled ? 'total' : '/hand'} value={num(s.weight)} onChange={(e) => onUpdate({ weight: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
+      <input style={S.setInput} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
       <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
     </>
   );
@@ -488,11 +544,12 @@ function SetRowCardio({ s, onUpdate, num, parseNum }) {
 
 /* Column header labels per modality */
 const SET_HEADERS = {
-  strength:   ['#', 'reps', 'weight', 'unit', ''],
-  bodyweight: ['#', 'reps', '+wt', 'unit', ''],
-  distance:   ['#', 'distance', 'unit', ''],
-  duration:   ['#', 'time (mm:ss)', ''],
-  cardio:     ['#', 'dist', 'unit', 'time', 'resist', ''],
+  strength:        ['#', 'reps', 'weight', 'unit', ''],
+  bodyweight:      ['#', 'reps', '+wt', 'unit', ''],
+  distance:        ['#', 'distance', 'unit', ''],
+  loaded_distance: ['#', 'weight', 'unit', 'dist', 'unit', ''],
+  duration:        ['#', 'time (mm:ss)', ''],
+  cardio:          ['#', 'dist', 'unit', 'time', 'resist', ''],
 };
 
 /* ===========================================================================
@@ -559,6 +616,11 @@ export default function App() {
               s.heightUnit = r0.suggestedHeightUnit || 'in';
             }
           } else if (modality === 'distance') {
+            s.distance = r0.suggestedDistance ?? null;
+            s.distUnit = r0.suggestedDistUnit || 'm';
+          } else if (modality === 'loaded_distance') {
+            s.weight   = r0.suggestedWeight ?? null;
+            s.weightUnit = r0.suggestedWeightUnit || 'kg';
             s.distance = r0.suggestedDistance ?? null;
             s.distUnit = r0.suggestedDistUnit || 'm';
           } else if (modality === 'duration') {
@@ -844,6 +906,9 @@ export default function App() {
                 {ex.guessed && ex.status === 'unknown'    && <div style={S.guessTag}>⚠ couldn't auto-name "{ex.original}" — please check</div>}
                 {ex.guessed && ex.status !== 'unknown'    && <div style={S.guessTag}>⚡ auto-suggested from "{ex.original}" — confirm ✓ or edit</div>}
                 {!ex.guessed && ex.status === 'remembered'&& <div style={S.rememberTag}>✓ remembered "{ex.original}" from before</div>}
+                {mod === 'loaded_distance' && (
+                  <div style={S.hintTag}>💡 {isSledType(ex.name) ? 'log total sled weight' : 'log weight per hand'}</div>
+                )}
 
                 {/* Set headers */}
                 <div style={S.setHeader}>
@@ -858,6 +923,7 @@ export default function App() {
                     {mod === 'strength'   && <SetRowStrength   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
                     {mod === 'bodyweight' && <SetRowBodyweight s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
                     {mod === 'distance'   && <SetRowDistance   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
+                    {mod === 'loaded_distance' && <SetRowLoadedDistance s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} sled={isSledType(ex.name)} />}
                     {mod === 'duration'   && <SetRowDuration   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} />}
                     {mod === 'cardio'     && <SetRowCardio     s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
                     <button style={S.delSm} onClick={() => removeSet(i, si)}>✕</button>
@@ -895,11 +961,11 @@ export default function App() {
               {chartData.length > 0 && (
                 <div style={S.statRow}>
                   <div style={S.statBox}>
-                    <div style={S.statVal} className="gt-stat-val">{fmtStatPrimary(primaryBest) ?? '—'}<span style={S.statUnit}>{modality === 'duration' ? '' : modality === 'cardio' ? '' : modality === 'distance' ? 'm' : modality === 'bodyweight' ? '' : 'kg'}</span></div>
+                    <div style={S.statVal} className="gt-stat-val">{fmtStatPrimary(primaryBest) ?? '—'}<span style={S.statUnit}>{cfg.primaryUnit}</span></div>
                     <div style={S.statLbl} className="gt-stat-lbl">{cfg.primaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
-                    <div style={S.statVal} className="gt-stat-val">{secondaryBest ?? '—'}<span style={S.statUnit}>{modality === 'distance' || modality === 'cardio' ? 'm' : modality === 'bodyweight' ? '' : modality === 'duration' ? 's' : 'kg'}</span></div>
+                    <div style={S.statVal} className="gt-stat-val">{secondaryBest ?? '—'}<span style={S.statUnit}>{cfg.secondaryUnit}</span></div>
                     <div style={S.statLbl} className="gt-stat-lbl">{cfg.secondaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
@@ -944,8 +1010,9 @@ export default function App() {
                   {/* ── SCATTER — always rendered, hidden on mobile if toggle is combined ── */}
                   <div className="gt-chart-panel" style={chartView !== 'scatter' ? { display: 'none' } : {}}>
                     <div style={S.chartCaption}>
-                      {modality === 'cardio'   ? 'Each dot = one set. Y = distance. Dot size = resistance.'
-                     : modality === 'strength' ? 'Each dot = one set. Y = weight. Dot size = rep count.'
+                      {modality === 'cardio'          ? 'Each dot = one set. Y = distance. Dot size = resistance.'
+                     : modality === 'strength'        ? 'Each dot = one set. Y = weight. Dot size = rep count.'
+                     : modality === 'loaded_distance' ? 'Each dot = one set. Y = load. Dot size = distance.'
                      : 'Each dot = one set. Y = primary metric over time.'}
                     </div>
                     <div className="gt-chart-height" style={{ marginTop: 6 }}>
@@ -964,6 +1031,7 @@ export default function App() {
                       {modality === 'strength'   && 'Bigger dots = more reps. High small dot = heavy low-rep set. Low big dot = high-volume set.'}
                       {modality === 'bodyweight' && 'Each dot is one set. Y = rep count.'}
                       {modality === 'distance'   && 'Each dot is one set. Y = distance covered.'}
+                      {modality === 'loaded_distance' && 'Each dot is one set. Y = load lifted. Bigger dot = longer distance carried.'}
                       {modality === 'duration'   && 'Each dot is one set. Y = hold duration in seconds.'}
                       {modality === 'cardio'     && 'Each dot is one set. Y = distance. Bigger dot = higher resistance.'}
                     </div>
@@ -1038,6 +1106,7 @@ const S = {
   guessBanner:{ background: 'rgba(215,255,50,0.08)', border: '1px solid rgba(215,255,50,0.35)', borderRadius: 10, padding: '11px 13px', fontSize: 12, color: '#d7ff32', lineHeight: 1.55, marginBottom: 14 },
   guessTag:   { fontSize: 11, color: '#aeb86b', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
   rememberTag:{ fontSize: 11, color: '#6b7080', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
+  hintTag:    { fontSize: 11, color: '#7fbfa0', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
   chips:      { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
   chip:       { padding: '7px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
   chipOn:     { background: ACCENT, color: '#0c0d10', borderColor: ACCENT, fontWeight: 500 },
