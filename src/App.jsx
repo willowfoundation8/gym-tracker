@@ -997,3 +997,4 @@ const S = {
   chartLabel: { fontSize: 12, color: '#8b909c', letterSpacing: 1 },
   note:       { fontSize: 11, color: '#6b7080', marginTop: 16, textAlign: 'center' },
 };
+
