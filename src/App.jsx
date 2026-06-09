@@ -45,7 +45,7 @@ async function extractExercises(base64) {
   const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
   const arr = JSON.parse(clean);
-  return arr.map((x) => ({ raw: (x.name || 'Exercise').trim(), suggestedReps: x.suggestedReps ?? null }));
+  return arr.map((x) => ({ raw: (x.name || 'Exercise').trim(), suggestedSets: x.suggestedSets ?? null, suggestedReps: x.suggestedReps ?? null }));
 }
 
 async function expandViaAI(rawList) {
@@ -121,14 +121,22 @@ export default function App() {
       setPreview(preview);
       const read = await extractExercises(base64);
       const resolved = await resolveNames(read.map((r) => r.raw));
-      const exercises = resolved.map((r, i) => ({
-        name: r.name,
-        original: r.original,
-        status: r.status,
-        guessed: r.status !== 'remembered',
-        sets: [{ reps: read[i].suggestedReps ?? null, weight: null, weightUnit: 'kg' }],
-      }));
-      setDraft({ className: null, exercises });
+      const exercises = resolved.map((r, i) => {
+        const count = read[i].suggestedSets ?? 1;
+        const sets = Array.from({ length: Math.max(1, count) }, () => ({
+          reps: read[i].suggestedReps ?? null,
+          weight: null,
+          weightUnit: 'kg',
+        }));
+        return {
+          name: r.name,
+          original: r.original,
+          status: r.status,
+          guessed: r.status !== 'remembered',
+          sets,
+        };
+      });
+      setDraft({ className: null, date: todayStr(), exercises });
       setScreen('edit');
     } catch (err) {
       setVisionErr("Couldn't read the board automatically — you can enter it by hand.");
@@ -140,7 +148,7 @@ export default function App() {
 
   function startManual() {
     setPreview(null);
-    setDraft({ className: null, exercises: [{ name: '', sets: [{ reps: null, weight: null, weightUnit: 'kg' }] }] });
+    setDraft({ className: null, date: todayStr(), exercises: [{ name: '', sets: [{ reps: null, weight: null, weightUnit: 'kg' }] }] });
     setScreen('edit');
   }
 
@@ -155,6 +163,12 @@ export default function App() {
   async function save() {
     const cleaned = { ...draft, exercises: draft.exercises.filter((ex) => (ex.name || '').trim()) };
     if (!cleaned.exercises.length) { setScreen('home'); setDraft(null); return; }
+    // Persist the user-chosen date; fall back to now only if somehow missing
+    if (cleaned.date) {
+      cleaned.date = new Date(cleaned.date + 'T12:00:00').toISOString();
+    } else {
+      cleaned.date = new Date().toISOString();
+    }
     await learnAbbrev(cleaned.exercises.filter((e) => e.original && e.original !== e.name).map((e) => ({ raw: e.original, name: (e.name || '').trim() })));
     await saveWorkout(cleaned);
     setDraft(null); setPreview(null);
@@ -164,7 +178,14 @@ export default function App() {
 
   async function openWorkout(id) {
     const w = await getWorkout(id);
-    if (w) { setDraft(w); setPreview(null); setScreen('edit'); }
+    if (w) {
+      // Convert stored ISO date → YYYY-MM-DD for the date input
+      const d = w.date ? new Date(w.date) : new Date();
+      const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      setDraft({ ...w, date: dateStr });
+      setPreview(null);
+      setScreen('edit');
+    }
   }
   async function remove(id) {
     await deleteWorkout(id);
@@ -186,6 +207,10 @@ export default function App() {
 
   const num = (v) => (v === null || v === undefined || v === '' ? '' : v);
   const parseNum = (v) => (v === '' ? null : Number(v));
+  function todayStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
 
   return (
     <div style={S.shell}>
@@ -254,6 +279,12 @@ export default function App() {
 
           {preview && <img src={preview} alt="board" style={S.previewThumb} />}
 
+          <input
+            style={{ ...S.input, ...S.dateInput }}
+            type="date"
+            value={draft.date || ''}
+            onChange={(e) => setDraftField({ date: e.target.value })}
+          />
           <input style={S.input} placeholder="Class / workout name (optional)" value={num(draft.className)} onChange={(e) => setDraftField({ className: e.target.value })} />
 
           {draft.exercises.some((e) => e.guessed) && (
@@ -350,6 +381,7 @@ const S = {
   errBox: { marginTop: 12, padding: 12, background: '#1a1115', border: '1px solid #5a2330', borderRadius: 10, color: '#ff9aa6', fontSize: 12.5, lineHeight: 1.5 },
   inlineBtn: { background: 'none', border: 'none', color: ACCENT, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12.5, padding: 0 },
   input: { width: '100%', padding: '12px 14px', background: '#13151b', border: '1px solid #20232b', borderRadius: 10, color: '#e7e9ee', fontSize: 14, marginBottom: 14 },
+  dateInput: { colorScheme: 'dark', marginBottom: 10 },
   card: { background: '#11131a', border: '1px solid #1d2027', borderRadius: 12, padding: 14, marginBottom: 12 },
   cardHead: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
   exName: { flex: 1, padding: '10px 12px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 16 },
