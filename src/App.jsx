@@ -3,10 +3,13 @@
 // Anthropic key stays server-side. UI is identical to the artifact build.
 
 import { useState, useEffect, useRef } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import {
+  ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ScatterChart, Scatter, ZAxis, Legend,
+} from 'recharts';
 import {
   getWorkouts, getWorkout, saveWorkout, deleteWorkout,
-  getExerciseNames, getExerciseHistory, getAbbrevMap, learnAbbrev, nameKey,
+  getExerciseNames, getAbbrevMap, learnAbbrev, nameKey,
 } from './db';
 
 /* ===========================================================================
@@ -86,9 +89,107 @@ async function resolveNames(rawList) {
 }
 
 /* ===========================================================================
+   PROGRESS METRICS — computed client-side from raw workout data
+   Epley e1RM formula: weight × (1 + reps / 30)
+   Volume Load: sum of (sets × reps × weight) across all sets
+=========================================================================== */
+function epley(weight, reps) {
+  if (!weight || !reps || weight <= 0 || reps <= 0) return null;
+  if (reps === 1) return weight; // 1RM is the weight itself
+  return Math.round(weight * (1 + reps / 30));
+}
+
+function computeProgressData(workouts, exerciseName) {
+  const key = nameKey(exerciseName);
+  const sessions = [];
+
+  for (const w of workouts) {
+    const ex = w.exercises.find((e) => nameKey(e.name) === key);
+    if (!ex) continue;
+
+    const validSets = ex.sets.filter((s) => s.weight > 0 && s.reps > 0);
+    if (!validSets.length) continue;
+
+    // e1RM: best across all sets in this session
+    const bestE1rm = validSets.reduce((best, s) => {
+      const v = epley(s.weight, s.reps);
+      return v > best ? v : best;
+    }, 0);
+
+    // Volume load: total work done this session
+    const volume = validSets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+
+    // Top set weight (heaviest single set)
+    const topWeight = Math.max(...validSets.map((s) => s.weight));
+
+    // Total reps across all sets
+    const totalReps = validSets.reduce((sum, s) => sum + s.reps, 0);
+    const totalSets = validSets.length;
+
+    const label = new Date(w.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+    sessions.push({
+      date: w.date,
+      label,
+      e1rm: bestE1rm || null,
+      volume: Math.round(volume),
+      topWeight,
+      totalReps,
+      totalSets,
+      // For scatter: each valid set becomes its own point
+      scatterSets: validSets.map((s) => ({
+        date: w.date,
+        label,
+        weight: s.weight,
+        reps: s.reps,
+        // Bubble size = reps (scaled); ZAxis handles the visual scaling
+        z: s.reps,
+      })),
+    });
+  }
+
+  // Sort chronologically
+  sessions.sort((a, b) => new Date(a.date) - new Date(b.date));
+  return sessions;
+}
+
+/* ===========================================================================
+   CUSTOM TOOLTIP COMPONENTS
+=========================================================================== */
+function CombinedTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  return (
+    <div style={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, padding: '10px 13px', fontSize: 12, lineHeight: 1.8 }}>
+      <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      {d.e1rm   && <div style={{ color: '#d7ff32' }}>e1RM: <b>{d.e1rm} kg</b></div>}
+      {d.volume && <div style={{ color: '#6b9fff' }}>Volume: <b>{d.volume} kg</b></div>}
+      <div style={{ color: '#8b909c', marginTop: 4, borderTop: '1px solid #2a2e38', paddingTop: 4 }}>
+        {d.totalSets} sets · {d.totalReps} reps · top {d.topWeight} kg
+      </div>
+    </div>
+  );
+}
+
+function ScatterTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  return (
+    <div style={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, padding: '10px 13px', fontSize: 12, lineHeight: 1.8 }}>
+      <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
+      <div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.reps} reps</div>
+      <div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div>
+    </div>
+  );
+}
+
+/* ===========================================================================
    UI
 =========================================================================== */
 const ACCENT = '#d7ff32';
+const BLUE   = '#6b9fff';
 
 export default function App() {
   const [screen, setScreen] = useState('home');
@@ -99,13 +200,17 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [visionErr, setVisionErr] = useState(null);
   const [chartName, setChartName] = useState(null);
-  const [chartData, setChartData] = useState([]);
+  const [chartData, setChartData] = useState([]);   // array of session objects
+  const [chartView, setChartView] = useState('combined'); // 'combined' | 'scatter'
   const fileRef = useRef(null);
   const cameraRef = useRef(null);
 
   async function refresh() {
-    setWorkouts(await getWorkouts());
+    const ws = await getWorkouts();
+    setWorkouts(ws);
     setNames(await getExerciseNames());
+    // If a chart is already selected, recompute from fresh data
+    if (chartName) setChartData(computeProgressData(ws, chartName));
   }
   useEffect(() => { refresh(); }, []);
 
@@ -163,7 +268,6 @@ export default function App() {
   async function save() {
     const cleaned = { ...draft, exercises: draft.exercises.filter((ex) => (ex.name || '').trim()) };
     if (!cleaned.exercises.length) { setScreen('home'); setDraft(null); return; }
-    // Persist the user-chosen date; fall back to now only if somehow missing
     if (cleaned.date) {
       cleaned.date = new Date(cleaned.date + 'T12:00:00').toISOString();
     } else {
@@ -179,7 +283,6 @@ export default function App() {
   async function openWorkout(id) {
     const w = await getWorkout(id);
     if (w) {
-      // Convert stored ISO date → YYYY-MM-DD for the date input
       const d = w.date ? new Date(w.date) : new Date();
       const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
       setDraft({ ...w, date: dateStr });
@@ -193,16 +296,19 @@ export default function App() {
   }
 
   async function openProgress() {
-    await refresh();
+    const ws = await getWorkouts();
+    setWorkouts(ws);
     const ns = await getExerciseNames();
+    setNames(ns);
     const first = ns[0] || null;
     setChartName(first);
-    setChartData(first ? await getExerciseHistory(first) : []);
+    setChartData(first ? computeProgressData(ws, first) : []);
     setScreen('progress');
   }
-  async function pickChart(n) {
+
+  function pickChart(n) {
     setChartName(n);
-    setChartData(await getExerciseHistory(n));
+    setChartData(computeProgressData(workouts, n));
   }
 
   const num = (v) => (v === null || v === undefined || v === '' ? '' : v);
@@ -211,6 +317,14 @@ export default function App() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
+
+  // Flatten all per-set scatter points from all sessions for the scatter chart
+  const scatterPoints = chartData.flatMap((s) => s.scatterSets || []);
+
+  // Stats summary for the selected exercise
+  const bestE1rm    = chartData.length ? Math.max(...chartData.map((d) => d.e1rm || 0)) : null;
+  const bestVolume  = chartData.length ? Math.max(...chartData.map((d) => d.volume || 0)) : null;
+  const totalSessions = chartData.length;
 
   return (
     <div style={S.shell}>
@@ -237,7 +351,7 @@ export default function App() {
 
           <div style={S.label}>HISTORY</div>
           {workouts.length === 0 ? (
-            <div style={S.empty}>No workouts yet. Tap “New Workout”, snap the board, and log your sets.</div>
+            <div style={S.empty}>No workouts yet. Tap "New Workout", snap the board, and log your sets.</div>
           ) : workouts.map((w) => (
             <div key={w.id} style={S.row} onClick={() => openWorkout(w.id)}>
               <div style={{ flex: 1 }}>
@@ -288,7 +402,7 @@ export default function App() {
           <input style={S.input} placeholder="Class / workout name (optional)" value={num(draft.className)} onChange={(e) => setDraftField({ className: e.target.value })} />
 
           {draft.exercises.some((e) => e.guessed) && (
-            <div style={S.guessBanner}>⚡ Shorthand names were auto-suggested (e.g. “DB SA Row” → “Dumbbell Single Arm Row”). Tap a highlighted name to fix it, or ✓ to confirm. Once saved, each one is remembered — no re-asking next time.</div>
+            <div style={S.guessBanner}>⚡ Shorthand names were auto-suggested (e.g. "DB SA Row" → "Dumbbell Single Arm Row"). Tap a highlighted name to fix it, or ✓ to confirm. Once saved, each one is remembered — no re-asking next time.</div>
           )}
 
           {draft.exercises.map((ex, i) => (
@@ -298,9 +412,9 @@ export default function App() {
                 {ex.guessed && <button style={S.confirmBtn} title="confirm name" onClick={() => updateExercise(i, { guessed: false, status: 'confirmed' })}>✓</button>}
                 <button style={S.del} onClick={() => removeExercise(i)}>✕</button>
               </div>
-              {ex.guessed && ex.status === 'unknown' && <div style={S.guessTag}>⚠ couldn’t auto-name “{ex.original}” — please check</div>}
-              {ex.guessed && ex.status !== 'unknown' && <div style={S.guessTag}>⚡ auto-suggested from “{ex.original}” — confirm ✓ or edit</div>}
-              {!ex.guessed && ex.status === 'remembered' && <div style={S.rememberTag}>✓ remembered “{ex.original}” from before</div>}
+              {ex.guessed && ex.status === 'unknown' && <div style={S.guessTag}>⚠ couldn't auto-name "{ex.original}" — please check</div>}
+              {ex.guessed && ex.status !== 'unknown' && <div style={S.guessTag}>⚡ auto-suggested from "{ex.original}" — confirm ✓ or edit</div>}
+              {!ex.guessed && ex.status === 'remembered' && <div style={S.rememberTag}>✓ remembered "{ex.original}" from before</div>}
               <div style={S.setHeader}><span style={{ width: 28 }}>#</span><span style={S.col}>reps</span><span style={S.col}>weight</span><span style={{ width: 56 }}>unit</span><span style={{ width: 28 }} /></div>
               {ex.sets.map((s, si) => (
                 <div key={si} style={S.setRow}>
@@ -324,31 +438,106 @@ export default function App() {
         <div style={S.page}>
           <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
           <h2 style={S.h2}>PROGRESS</h2>
+
           {names.length === 0 ? (
             <div style={S.empty}>Log a few workouts and your exercise trends will show up here.</div>
           ) : (
             <>
+              {/* Exercise selector chips */}
               <div style={S.chips}>
                 {names.map((n) => (
                   <button key={n} onClick={() => pickChart(n)} style={{ ...S.chip, ...(n === chartName ? S.chipOn : {}) }}>{n}</button>
                 ))}
               </div>
-              <div style={S.chartLabel}>{chartName} — top set weight over time</div>
-              <div style={{ height: 240, marginTop: 8 }}>
-                {chartData.length < 2 ? (
-                  <div style={S.empty}>Need at least two logged sessions of “{chartName}” to chart a trend.</div>
-                ) : (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={chartData.map((d) => ({ ...d, label: new Date(d.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }))}>
-                      <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
-                      <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
-                      <YAxis tick={{ fill: '#8b909c', fontSize: 11 }} width={32} />
-                      <Tooltip contentStyle={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, color: '#e7e9ee' }} />
-                      <Line type="monotone" dataKey="weight" stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                )}
+
+              {/* Stats summary row */}
+              {chartData.length > 0 && (
+                <div style={S.statRow}>
+                  <div style={S.statBox}>
+                    <div style={S.statVal}>{bestE1rm ?? '—'}<span style={S.statUnit}>kg</span></div>
+                    <div style={S.statLbl}>BEST e1RM</div>
+                  </div>
+                  <div style={S.statBox}>
+                    <div style={S.statVal}>{bestVolume ?? '—'}<span style={S.statUnit}>kg</span></div>
+                    <div style={S.statLbl}>PEAK VOL.</div>
+                  </div>
+                  <div style={S.statBox}>
+                    <div style={S.statVal}>{totalSessions}</div>
+                    <div style={S.statLbl}>SESSIONS</div>
+                  </div>
+                </div>
+              )}
+
+              {/* Chart view toggle */}
+              <div style={S.toggle}>
+                <button style={{ ...S.toggleBtn, ...(chartView === 'combined' ? S.toggleOn : {}) }} onClick={() => setChartView('combined')}>COMBINED</button>
+                <button style={{ ...S.toggleBtn, ...(chartView === 'scatter'  ? S.toggleOn : {}) }} onClick={() => setChartView('scatter')}>SCATTER</button>
               </div>
+
+              {chartData.length < 2 ? (
+                <div style={S.empty}>Need at least two logged sessions of "{chartName}" to chart a trend.</div>
+              ) : (
+                <>
+                  {/* ── COMBINED: e1RM line + Volume bars ── */}
+                  {chartView === 'combined' && (
+                    <>
+                      <div style={S.chartCaption}>
+                        <span style={{ color: ACCENT }}>━</span> Estimated 1-rep max (e1RM) &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> Volume load (sets × reps × kg)
+                      </div>
+                      <div style={{ height: 260, marginTop: 6 }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <ComposedChart data={chartData} margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
+                            <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
+                            <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
+                            {/* Left Y: e1RM */}
+                            <YAxis yAxisId="e1rm" orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={36} tickFormatter={(v) => `${v}`} />
+                            {/* Right Y: volume */}
+                            <YAxis yAxisId="vol"  orientation="right" tick={{ fill: '#6b9fff', fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                            <Tooltip content={<CombinedTooltip />} />
+                            <Bar  yAxisId="vol"  dataKey="volume"  fill={BLUE}  opacity={0.45} radius={[3,3,0,0]} name="Volume" />
+                            <Line yAxisId="e1rm" dataKey="e1rm"   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} name="e1RM" connectNulls />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div style={S.chartNote}>
+                        e1RM normalises any set to a "if you went all-out" number — so a heavy 1×3 and a lighter 4×12 are comparable.
+                      </div>
+                    </>
+                  )}
+
+                  {/* ── SCATTER: each set as a dot. Y = weight, bubble size = reps ── */}
+                  {chartView === 'scatter' && (
+                    <>
+                      <div style={S.chartCaption}>
+                        Each dot = one set. Y-axis = weight lifted. Dot size = rep count.
+                      </div>
+                      <div style={{ height: 260, marginTop: 6 }}>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <ScatterChart margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
+                            <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
+                            <XAxis
+                              dataKey="label"
+                              type="category"
+                              allowDuplicatedCategory={false}
+                              tick={{ fill: '#8b909c', fontSize: 11 }}
+                              name="Date"
+                            />
+                            <YAxis dataKey="weight" tick={{ fill: '#8b909c', fontSize: 11 }} width={36} name="Weight" unit="kg" />
+                            {/* ZAxis maps rep count → visual dot radius (px²) */}
+                            <ZAxis dataKey="z" range={[40, 260]} name="Reps" />
+                            <Tooltip content={<ScatterTooltip />} />
+                            <Scatter data={scatterPoints} fill={ACCENT} fillOpacity={0.75} />
+                          </ScatterChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div style={S.chartNote}>
+                        Bigger dots = more reps. Heavy low-rep sets appear as small high dots; volume sets appear as large lower dots.
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+
               <div style={S.note}>Next up (v1.1): personal records and streaks.</div>
             </>
           )}
@@ -359,49 +548,62 @@ export default function App() {
 }
 
 const S = {
-  shell: { background: '#0c0d10', color: '#e7e9ee', minHeight: '100vh', fontFamily: "'IBM Plex Mono', ui-monospace, monospace" },
-  page: { maxWidth: 540, margin: '0 auto', padding: '26px 18px 70px', animation: 'rise .25s ease' },
-  kicker: { fontSize: 11, letterSpacing: 3, color: ACCENT, fontWeight: 500 },
-  h1: { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 44, lineHeight: 1, margin: '6px 0 8px', letterSpacing: 1 },
-  h2: { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 30, margin: '4px 0 6px', letterSpacing: 1 },
-  sub: { fontSize: 12.5, color: '#8b909c', marginBottom: 22, lineHeight: 1.5 },
-  cta: { width: '100%', padding: '15px', background: ACCENT, color: '#0c0d10', border: 'none', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 15, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
-  ghost: { width: '100%', padding: '13px', background: 'transparent', color: '#cfd3dc', border: '1px solid #2a2e38', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 14, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
-  label: { fontSize: 11, letterSpacing: 2, color: '#8b909c', margin: '24px 0 10px' },
-  empty: { padding: '22px 16px', border: '1px dashed #2a2e38', borderRadius: 10, color: '#6b7080', fontSize: 13, textAlign: 'center', lineHeight: 1.6 },
-  row: { display: 'flex', alignItems: 'center', gap: 10, padding: '13px 14px', background: '#13151b', border: '1px solid #1d2027', borderRadius: 10, marginBottom: 8, cursor: 'pointer' },
-  rowDate: { fontSize: 11, color: ACCENT, marginBottom: 3, letterSpacing: 1 },
-  rowName: { fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 17 },
-  rowMeta: { fontSize: 11, color: '#7b8090', marginTop: 3 },
-  back: { background: 'none', border: 'none', color: '#8b909c', fontSize: 13, padding: '4px 0', marginBottom: 8, cursor: 'pointer', fontFamily: 'inherit' },
+  shell:      { background: '#0c0d10', color: '#e7e9ee', minHeight: '100vh', fontFamily: "'IBM Plex Mono', ui-monospace, monospace" },
+  page:       { maxWidth: 540, margin: '0 auto', padding: '26px 18px 70px', animation: 'rise .25s ease' },
+  kicker:     { fontSize: 11, letterSpacing: 3, color: ACCENT, fontWeight: 500 },
+  h1:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 44, lineHeight: 1, margin: '6px 0 8px', letterSpacing: 1 },
+  h2:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 30, margin: '4px 0 6px', letterSpacing: 1 },
+  sub:        { fontSize: 12.5, color: '#8b909c', marginBottom: 22, lineHeight: 1.5 },
+  cta:        { width: '100%', padding: '15px', background: ACCENT, color: '#0c0d10', border: 'none', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 15, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
+  ghost:      { width: '100%', padding: '13px', background: 'transparent', color: '#cfd3dc', border: '1px solid #2a2e38', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 14, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
+  label:      { fontSize: 11, letterSpacing: 2, color: '#8b909c', margin: '24px 0 10px' },
+  empty:      { padding: '22px 16px', border: '1px dashed #2a2e38', borderRadius: 10, color: '#6b7080', fontSize: 13, textAlign: 'center', lineHeight: 1.6 },
+  row:        { display: 'flex', alignItems: 'center', gap: 10, padding: '13px 14px', background: '#13151b', border: '1px solid #1d2027', borderRadius: 10, marginBottom: 8, cursor: 'pointer' },
+  rowDate:    { fontSize: 11, color: ACCENT, marginBottom: 3, letterSpacing: 1 },
+  rowName:    { fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 17 },
+  rowMeta:    { fontSize: 11, color: '#7b8090', marginTop: 3 },
+  back:       { background: 'none', border: 'none', color: '#8b909c', fontSize: 13, padding: '4px 0', marginBottom: 8, cursor: 'pointer', fontFamily: 'inherit' },
   previewImg: { width: '100%', borderRadius: 12, border: '1px solid #1d2027', margin: '6px 0 16px' },
   previewThumb: { width: '100%', maxHeight: 150, objectFit: 'cover', borderRadius: 10, border: '1px solid #1d2027', margin: '6px 0 14px' },
-  loading: { display: 'flex', alignItems: 'center', gap: 12, padding: '20px 4px', color: '#cfd3dc', fontSize: 14 },
-  spinner: { width: 22, height: 22, border: '3px solid #2a2e38', borderTopColor: ACCENT, borderRadius: '50%', animation: 'spin .8s linear infinite' },
-  errBox: { marginTop: 12, padding: 12, background: '#1a1115', border: '1px solid #5a2330', borderRadius: 10, color: '#ff9aa6', fontSize: 12.5, lineHeight: 1.5 },
-  inlineBtn: { background: 'none', border: 'none', color: ACCENT, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12.5, padding: 0 },
-  input: { width: '100%', padding: '12px 14px', background: '#13151b', border: '1px solid #20232b', borderRadius: 10, color: '#e7e9ee', fontSize: 14, marginBottom: 14 },
-  dateInput: { colorScheme: 'dark', marginBottom: 10 },
-  card: { background: '#11131a', border: '1px solid #1d2027', borderRadius: 12, padding: 14, marginBottom: 12 },
-  cardHead: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
-  exName: { flex: 1, padding: '10px 12px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 16 },
-  exNameGuess: { borderColor: ACCENT, boxShadow: '0 0 0 1px ' + ACCENT },
+  loading:    { display: 'flex', alignItems: 'center', gap: 12, padding: '20px 4px', color: '#cfd3dc', fontSize: 14 },
+  spinner:    { width: 22, height: 22, border: '3px solid #2a2e38', borderTopColor: ACCENT, borderRadius: '50%', animation: 'spin .8s linear infinite' },
+  errBox:     { marginTop: 12, padding: 12, background: '#1a1115', border: '1px solid #5a2330', borderRadius: 10, color: '#ff9aa6', fontSize: 12.5, lineHeight: 1.5 },
+  inlineBtn:  { background: 'none', border: 'none', color: ACCENT, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12.5, padding: 0 },
+  input:      { width: '100%', padding: '12px 14px', background: '#13151b', border: '1px solid #20232b', borderRadius: 10, color: '#e7e9ee', fontSize: 14, marginBottom: 14 },
+  dateInput:  { colorScheme: 'dark', marginBottom: 10 },
+  card:       { background: '#11131a', border: '1px solid #1d2027', borderRadius: 12, padding: 14, marginBottom: 12 },
+  cardHead:   { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
+  exName:     { flex: 1, padding: '10px 12px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 16 },
+  exNameGuess:{ borderColor: ACCENT, boxShadow: '0 0 0 1px ' + ACCENT },
   confirmBtn: { width: 40, padding: '8px 0', background: ACCENT, color: '#0c0d10', border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 700, cursor: 'pointer' },
-  setHeader: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, letterSpacing: 1, color: '#6b7080', marginBottom: 6, paddingLeft: 2 },
-  col: { flex: 1 },
-  setRow: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 },
-  setNo: { width: 28, fontSize: 12, color: '#7b8090', textAlign: 'center' },
-  setInput: { flex: 1, width: '100%', padding: '10px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontSize: 15, textAlign: 'center' },
-  unitBtn: { width: 56, padding: '10px 0', background: '#1a1d24', border: '1px solid #2a2e38', borderRadius: 8, color: ACCENT, fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
-  del: { background: 'none', border: 'none', color: '#6b7080', fontSize: 16, cursor: 'pointer', padding: '4px 8px' },
-  delSm: { width: 28, background: 'none', border: 'none', color: '#5a5f6b', fontSize: 13, cursor: 'pointer' },
-  addSet: { background: 'none', border: '1px dashed #2a2e38', borderRadius: 8, color: '#8b909c', fontFamily: 'inherit', fontSize: 12, padding: '8px', width: '100%', cursor: 'pointer', marginTop: 4 },
-  guessBanner: { background: 'rgba(215,255,50,0.08)', border: '1px solid rgba(215,255,50,0.35)', borderRadius: 10, padding: '11px 13px', fontSize: 12, color: '#d7ff32', lineHeight: 1.55, marginBottom: 14 },
-  guessTag: { fontSize: 11, color: '#aeb86b', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
-  rememberTag: { fontSize: 11, color: '#6b7080', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
-  chips: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 18 },
-  chip: { padding: '8px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
-  chipOn: { background: ACCENT, color: '#0c0d10', borderColor: ACCENT, fontWeight: 500 },
+  setHeader:  { display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, letterSpacing: 1, color: '#6b7080', marginBottom: 6, paddingLeft: 2 },
+  col:        { flex: 1 },
+  setRow:     { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 },
+  setNo:      { width: 28, fontSize: 12, color: '#7b8090', textAlign: 'center' },
+  setInput:   { flex: 1, width: '100%', padding: '10px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontSize: 15, textAlign: 'center' },
+  unitBtn:    { width: 56, padding: '10px 0', background: '#1a1d24', border: '1px solid #2a2e38', borderRadius: 8, color: ACCENT, fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  del:        { background: 'none', border: 'none', color: '#6b7080', fontSize: 16, cursor: 'pointer', padding: '4px 8px' },
+  delSm:      { width: 28, background: 'none', border: 'none', color: '#5a5f6b', fontSize: 13, cursor: 'pointer' },
+  addSet:     { background: 'none', border: '1px dashed #2a2e38', borderRadius: 8, color: '#8b909c', fontFamily: 'inherit', fontSize: 12, padding: '8px', width: '100%', cursor: 'pointer', marginTop: 4 },
+  guessBanner:{ background: 'rgba(215,255,50,0.08)', border: '1px solid rgba(215,255,50,0.35)', borderRadius: 10, padding: '11px 13px', fontSize: 12, color: '#d7ff32', lineHeight: 1.55, marginBottom: 14 },
+  guessTag:   { fontSize: 11, color: '#aeb86b', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
+  rememberTag:{ fontSize: 11, color: '#6b7080', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
+  chips:      { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  chip:       { padding: '8px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  chipOn:     { background: ACCENT, color: '#0c0d10', borderColor: ACCENT, fontWeight: 500 },
+  // Stats summary
+  statRow:    { display: 'flex', gap: 8, marginBottom: 16 },
+  statBox:    { flex: 1, background: '#11131a', border: '1px solid #1d2027', borderRadius: 10, padding: '10px 8px', textAlign: 'center' },
+  statVal:    { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 22, color: '#e7e9ee', lineHeight: 1 },
+  statUnit:   { fontSize: 11, color: '#8b909c', marginLeft: 2 },
+  statLbl:    { fontSize: 9, letterSpacing: 1.5, color: '#6b7080', marginTop: 4 },
+  // Chart toggle
+  toggle:     { display: 'flex', background: '#11131a', border: '1px solid #1d2027', borderRadius: 10, overflow: 'hidden', marginBottom: 14 },
+  toggleBtn:  { flex: 1, padding: '10px', background: 'transparent', border: 'none', color: '#6b7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: 1.5, cursor: 'pointer' },
+  toggleOn:   { background: '#1d2027', color: ACCENT },
+  // Chart annotations
+  chartCaption: { fontSize: 11, color: '#6b7080', marginBottom: 2, lineHeight: 1.5 },
+  chartNote:  { fontSize: 11, color: '#6b7080', marginTop: 10, lineHeight: 1.6, padding: '8px 10px', background: '#11131a', borderRadius: 8, border: '1px solid #1d2027' },
   chartLabel: { fontSize: 12, color: '#8b909c', letterSpacing: 1 },
-  note: { fontSize: 11, color: '#6b7080', marginTop: 16, textAlign: 'center' },
+  note:       { fontSize: 11, color: '#6b7080', marginTop: 16, textAlign: 'center' },
 };
