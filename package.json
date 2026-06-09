@@ -1,0 +1,19 @@
+{
+  "name": "gym-tracker",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "dexie": "^4",
+    "react": "^18",
+    "react-dom": "^18",
+    "recharts": "^2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4",
+    "vite": "^5"
+  }
+}
