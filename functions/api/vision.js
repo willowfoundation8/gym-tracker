@@ -1,6 +1,15 @@
 // functions/api/vision.js
-// Cloudflare Pages Function — proxies photo-to-exercises AI calls.
-// Anthropic API key stays here (server-side), never reaches the browser.
+// Includes a TEMPORARY GET handler to check if the API key is loaded.
+// Remove the onRequestGet block once you've confirmed things work.
+
+export async function onRequestGet({ env }) {
+  const key = env.ANTHROPIC_API_KEY;
+  return new Response(JSON.stringify({
+    keyLoaded: !!key,
+    keyLength: key ? key.length : 0,
+    keyPrefix: key ? key.slice(0, 7) : null,
+  }), { headers: { 'content-type': 'application/json' } });
+}
 
 export async function onRequestPost({ request, env }) {
   try {
@@ -26,4 +35,3 @@ export async function onRequestPost({ request, env }) {
     });
   }
 }
-
