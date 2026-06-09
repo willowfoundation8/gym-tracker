@@ -11,7 +11,10 @@ import {
   getWorkouts, getWorkout, saveWorkout, deleteWorkout,
   getExerciseNames, getAbbrevMap, learnAbbrev, nameKey,
   getModalityMap, learnModality,
+  exportAll, importAll, exportCSV,
 } from './db';
+
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 
 /* ===========================================================================
    MODALITY — seed dictionary + helpers
@@ -130,13 +133,14 @@ function nextModality(current) {
 function emptySet(modality, ref) {
   const unit = ref?.weightUnit || 'kg';
   const distUnit = ref?.distUnit || 'm';
+  const id = uid();
   switch (modality) {
-    case 'bodyweight': return { reps: null, weight: null, weightUnit: unit };
-    case 'distance':        return { distance: null, distUnit };
-    case 'loaded_distance': return { weight: null, weightUnit: unit, distance: null, distUnit };
-    case 'duration':        return { seconds: null };
-    case 'cardio':     return { distance: null, distUnit, seconds: null, resistance: 5 };
-    default:           return { reps: null, weight: null, weightUnit: unit };  // strength
+    case 'bodyweight':      return { id, reps: null, weight: null, weightUnit: unit };
+    case 'distance':        return { id, distance: null, distUnit };
+    case 'loaded_distance': return { id, weight: null, weightUnit: unit, distance: null, distUnit };
+    case 'duration':        return { id, seconds: null };
+    case 'cardio':          return { id, distance: null, distUnit, seconds: null, resistance: 5 };
+    default:                return { id, reps: null, weight: null, weightUnit: unit };  // strength
   }
 }
 
@@ -265,6 +269,27 @@ async function resolveNames(rawList) {
 }
 
 /* ===========================================================================
+   SHARED HELPERS
+=========================================================================== */
+// Canonical units for ALL metrics: kg and metres. Logged values keep their
+// chosen unit in storage; conversion happens once, at the compute boundary.
+const LB_TO_KG = 0.45359237;
+const toKg     = (w, unit) => (unit === 'lb' ? w * LB_TO_KG : w);
+const toMeters = (d, unit) => (unit === 'km' ? d * 1000 : d);
+
+// "5000" → "5 km", "750" → "750 m" — display-only
+function fmtDist(m) {
+  if (m === null || m === undefined) return '—';
+  return m >= 1000 ? `${(m / 1000) % 1 === 0 ? m / 1000 : (m / 1000).toFixed(2)} km` : `${Math.round(m)} m`;
+}
+
+// integer seconds → "m:ss" string for inputs (shared by duration + cardio rows)
+function secToInput(sec) {
+  if (!sec && sec !== 0) return '';
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+}
+
+/* ===========================================================================
    PROGRESS METRICS
 =========================================================================== */
 function epley(weight, reps) {
@@ -295,30 +320,45 @@ function parseSeconds(v) {
 
 function computeProgressData(workouts, exerciseName) {
   const key = nameKey(exerciseName);
-  const sessions = [];
 
+  // Pass 1: collect matching (workout, exercise) pairs so we can decide
+  // whether the date range spans multiple years (labels then include 'yy).
+  const matches = [];
   for (const w of workouts) {
     const ex = w.exercises.find((e) => nameKey(e.name) === key);
-    if (!ex) continue;
+    if (ex) matches.push({ w, ex });
+  }
+  const years = new Set(matches.map(({ w }) => new Date(w.date).getFullYear()));
+  const multiYear = years.size > 1;
+  const fmtLabel = (date) => {
+    const d = new Date(date);
+    const base = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return multiYear ? `${base} '${String(d.getFullYear()).slice(2)}` : base;
+  };
+
+  const sessions = [];
+  for (const { w, ex } of matches) {
     const modality = ex.modality || 'strength';
     const sets = ex.sets || [];
-    const label = new Date(w.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const label = fmtLabel(w.date);
     const base = { date: w.date, label, modality };
 
     if (modality === 'strength') {
-      const valid = sets.filter((s) => s.weight > 0 && s.reps > 0);
+      // Normalise lb → kg before any math so mixed-unit sessions compare correctly
+      const valid = sets.filter((s) => s.weight > 0 && s.reps > 0)
+        .map((s) => ({ ...s, kg: toKg(s.weight, s.weightUnit) }));
       if (!valid.length) continue;
-      const bestE1rm  = valid.reduce((b, s) => Math.max(b, epley(s.weight, s.reps) || 0), 0);
-      const volume    = valid.reduce((sum, s) => sum + s.weight * s.reps, 0);
-      const topWeight = Math.max(...valid.map((s) => s.weight));
+      const bestE1rm  = valid.reduce((b, s) => Math.max(b, epley(s.kg, s.reps) || 0), 0);
+      const volume    = valid.reduce((sum, s) => sum + s.kg * s.reps, 0);
+      const topWeight = Math.max(...valid.map((s) => s.kg));
       const totalReps = valid.reduce((sum, s) => sum + s.reps, 0);
       sessions.push({
         ...base,
-        e1rm: bestE1rm || null,
+        e1rm: Math.round(bestE1rm) || null,
         volume: Math.round(volume),
-        topWeight, totalReps,
+        topWeight: Math.round(topWeight * 10) / 10, totalReps,
         totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'strength', weight: s.weight, reps: s.reps, z: s.reps })),
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'strength', weight: Math.round(s.kg * 10) / 10, reps: s.reps, z: s.reps })),
       });
 
     } else if (modality === 'bodyweight') {
@@ -330,22 +370,25 @@ function computeProgressData(workouts, exerciseName) {
         scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'bodyweight', weight: s.reps, reps: s.reps, z: s.reps })) });
 
     } else if (modality === 'distance') {
-      const valid = sets.filter((s) => s.distance > 0);
+      // Normalise km → m so a 5km run and an 800m run aggregate correctly
+      const valid = sets.filter((s) => s.distance > 0)
+        .map((s) => ({ ...s, m: toMeters(s.distance, s.distUnit) }));
       if (!valid.length) continue;
-      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
-      const bestDist  = Math.max(...valid.map((s) => s.distance));
-      sessions.push({ ...base, totalDist, bestDist, totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'distance', weight: s.distance, unit: s.distUnit, reps: 1, z: 20 })) });
+      const totalDist = valid.reduce((sum, s) => sum + s.m, 0);
+      const bestDist  = Math.max(...valid.map((s) => s.m));
+      sessions.push({ ...base, totalDist: Math.round(totalDist), bestDist: Math.round(bestDist), totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'distance', weight: Math.round(s.m), unit: 'm', reps: 1, z: 20 })) });
 
     } else if (modality === 'loaded_distance') {
-      // Work = load × distance (kg·m). Rises if you push more weight OR further.
-      const valid = sets.filter((s) => s.weight > 0 && s.distance > 0);
+      // Work = load(kg) × distance(m). Rises if you push more weight OR further.
+      const valid = sets.filter((s) => s.weight > 0 && s.distance > 0)
+        .map((s) => ({ ...s, kg: toKg(s.weight, s.weightUnit), m: toMeters(s.distance, s.distUnit) }));
       if (!valid.length) continue;
-      const bestWork  = valid.reduce((b, s) => Math.max(b, s.weight * s.distance), 0);
-      const topWeight = Math.max(...valid.map((s) => s.weight));
-      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
-      sessions.push({ ...base, work: Math.round(bestWork), topWeight, totalDist, totalSets: valid.length,
-        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'loaded_distance', weight: s.weight, dist: s.distance, unit: s.distUnit, reps: s.distance, z: Math.max(20, s.distance) })) });
+      const bestWork  = valid.reduce((b, s) => Math.max(b, s.kg * s.m), 0);
+      const topWeight = Math.max(...valid.map((s) => s.kg));
+      const totalDist = valid.reduce((sum, s) => sum + s.m, 0);
+      sessions.push({ ...base, work: Math.round(bestWork), topWeight: Math.round(topWeight * 10) / 10, totalDist: Math.round(totalDist), totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'loaded_distance', weight: Math.round(s.kg * 10) / 10, dist: Math.round(s.m), unit: 'm', reps: s.m, z: Math.max(20, s.m) })) });
 
     } else if (modality === 'duration') {
       const valid = sets.filter((s) => s.seconds > 0);
@@ -356,21 +399,22 @@ function computeProgressData(workouts, exerciseName) {
         scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'duration', weight: s.seconds, reps: 1, z: 20 })) });
 
     } else if (modality === 'cardio') {
-      // Effort score: (distance / time_s) × (1 + resistance / 20)
-      const valid = sets.filter((s) => s.distance > 0 && s.seconds > 0);
+      // Effort score: (metres / time_s) × (1 + resistance / 20)
+      const valid = sets.filter((s) => s.distance > 0 && s.seconds > 0)
+        .map((s) => ({ ...s, m: toMeters(s.distance, s.distUnit) }));
       if (!valid.length) continue;
       const bestEffort = valid.reduce((best, s) => {
-        const pace = s.distance / s.seconds;
+        const pace = s.m / s.seconds;
         const effort = pace * (1 + (s.resistance || 0) / 20);
         return effort > best ? effort : best;
       }, 0);
-      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
+      const totalDist = valid.reduce((sum, s) => sum + s.m, 0);
       sessions.push({ ...base,
         effort: Math.round(bestEffort * 1000) / 1000,
-        totalDist, totalSets: valid.length,
+        totalDist: Math.round(totalDist), totalSets: valid.length,
         scatterSets: valid.map((s) => ({
           date: w.date, label, mod: 'cardio',
-          weight: s.distance, unit: s.distUnit,
+          weight: Math.round(s.m), unit: 'm',
           reps: s.resistance || 0,
           z: Math.max(20, (s.resistance || 0) * 20),
         })),
@@ -395,10 +439,10 @@ function CombinedTooltip({ active, payload, label }) {
       <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{label}</div>
       {mod === 'strength'   && <><div style={{ color: '#d7ff32'  }}>e1RM: <b>{d.e1rm} kg</b></div><div style={{ color: '#6b9fff' }}>Volume: <b>{d.volume} kg</b></div></>}
       {mod === 'bodyweight' && <><div style={{ color: '#d7ff32'  }}>Max reps: <b>{d.maxReps}</b></div><div style={{ color: '#6b9fff' }}>Total reps: <b>{d.totalReps}</b></div></>}
-      {mod === 'distance'   && <><div style={{ color: '#d7ff32'  }}>Best set: <b>{d.bestDist} m</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{d.totalDist} m</b></div></>}
+      {mod === 'distance'   && <><div style={{ color: '#d7ff32'  }}>Best set: <b>{fmtDist(d.bestDist)}</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{fmtDist(d.totalDist)}</b></div></>}
       {mod === 'loaded_distance' && <><div style={{ color: '#d7ff32'  }}>Work: <b>{d.work} kg·m</b></div><div style={{ color: '#6b9fff' }}>Best load: <b>{d.topWeight} kg</b></div></>}
       {mod === 'duration'   && <><div style={{ color: '#d7ff32'  }}>Best hold: <b>{fmtSeconds(d.bestSeconds)}</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{fmtSeconds(d.totalSeconds)}</b></div></>}
-      {mod === 'cardio'     && <><div style={{ color: '#d7ff32'  }}>Effort score: <b>{d.effort}</b></div><div style={{ color: '#6b9fff' }}>Distance: <b>{d.totalDist} m</b></div></>}
+      {mod === 'cardio'     && <><div style={{ color: '#d7ff32'  }}>Effort score: <b>{d.effort}</b></div><div style={{ color: '#6b9fff' }}>Distance: <b>{fmtDist(d.totalDist)}</b></div></>}
       <div style={{ color: '#8b909c', marginTop: 4, borderTop: '1px solid #2a2e38', paddingTop: 4 }}>{d.totalSets} set{d.totalSets !== 1 ? 's' : ''}</div>
     </div>
   );
@@ -414,10 +458,10 @@ function ScatterTooltip({ active, payload }) {
       <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
       {mod === 'strength'        && <><div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.reps} reps</div><div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div></>}
       {mod === 'bodyweight'      && <div style={{ color: '#e7e9ee' }}>{d.reps} reps</div>}
-      {mod === 'distance'        && <div style={{ color: '#e7e9ee' }}>{d.weight} {d.unit || 'm'}</div>}
-      {mod === 'loaded_distance' && <div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.dist} {d.unit || 'm'}</div>}
+      {mod === 'distance'        && <div style={{ color: '#e7e9ee' }}>{fmtDist(d.weight)}</div>}
+      {mod === 'loaded_distance' && <div style={{ color: '#e7e9ee' }}>{d.weight} kg × {fmtDist(d.dist)}</div>}
       {mod === 'duration'        && <div style={{ color: '#e7e9ee' }}>{fmtSeconds(d.weight)}</div>}
-      {mod === 'cardio'          && <div style={{ color: '#e7e9ee' }}>{d.weight} {d.unit || 'm'} · resist {d.reps}</div>}
+      {mod === 'cardio'          && <div style={{ color: '#e7e9ee' }}>{fmtDist(d.weight)} · resist {d.reps}</div>}
     </div>
   );
 }
@@ -437,7 +481,7 @@ const CHART_CONFIG = {
 /* ===========================================================================
    SET ROW COMPONENTS
 =========================================================================== */
-function SetRowStrength({ s, si, onUpdate, onRemove, num, parseNum }) {
+function SetRowStrength({ s, onUpdate, num, parseNum }) {
   return (
     <>
       <input style={S.setInput} type="number" inputMode="numeric"  placeholder="–" value={num(s.reps)}   onChange={(e) => onUpdate({ reps:   parseNum(e.target.value) })} />
@@ -447,7 +491,7 @@ function SetRowStrength({ s, si, onUpdate, onRemove, num, parseNum }) {
   );
 }
 
-function SetRowBodyweight({ s, onUpdate, onRemove, num, parseNum }) {
+function SetRowBodyweight({ s, onUpdate, num, parseNum }) {
   // When the board specified a box-jump-style height, the set carries a `height`
   // key. Show a height field (+ in/cm toggle) in place of the optional weight.
   const hasHeight = Object.prototype.hasOwnProperty.call(s, 'height');
@@ -492,12 +536,8 @@ function SetRowLoadedDistance({ s, onUpdate, num, parseNum, sled }) {
 
 function SetRowDuration({ s, onUpdate, num }) {
   // Store as integer seconds; display/edit as mm:ss
-  const toDisplay = (sec) => {
-    if (!sec && sec !== 0) return '';
-    return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
-  };
-  const [raw, setRaw] = useState(toDisplay(s.seconds));
-  useEffect(() => { setRaw(toDisplay(s.seconds)); }, [s.seconds]);
+  const [raw, setRaw] = useState(secToInput(s.seconds));
+  useEffect(() => { setRaw(secToInput(s.seconds)); }, [s.seconds]);
   return (
     <input
       style={{ ...S.setInput, flex: 2 }}
@@ -512,12 +552,8 @@ function SetRowDuration({ s, onUpdate, num }) {
 }
 
 function SetRowCardio({ s, onUpdate, num, parseNum }) {
-  const toDisplay = (sec) => {
-    if (!sec && sec !== 0) return '';
-    return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
-  };
-  const [rawTime, setRawTime] = useState(toDisplay(s.seconds));
-  useEffect(() => { setRawTime(toDisplay(s.seconds)); }, [s.seconds]);
+  const [rawTime, setRawTime] = useState(secToInput(s.seconds));
+  useEffect(() => { setRawTime(secToInput(s.seconds)); }, [s.seconds]);
   const res = s.resistance ?? 5;
   return (
     <>
@@ -569,8 +605,11 @@ export default function App() {
   const [chartName, setChartName] = useState(null);
   const [chartData, setChartData] = useState([]);
   const [chartView, setChartView] = useState('combined');
+  const [confirmId, setConfirmId] = useState(null);   // two-tap delete guard
+  const [dataMsg, setDataMsg]     = useState(null);    // export/import feedback
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
+  const importRef = useRef(null);
 
   async function refresh() {
     const ws = await getWorkouts();
@@ -632,8 +671,13 @@ export default function App() {
           }
           return s;
         });
-        return { name: canonical, original: r.original, status: r.status, guessed: r.status !== 'remembered', modality, sets };
+        return { id: uid(), name: canonical, original: r.original, status: r.status, guessed: r.status !== 'remembered', modality, sets };
       });
+      // Flag exercises the board listed more than once (kept separate by design —
+      // e.g. paired stations that repeat — but worth a heads-up).
+      const counts = {};
+      exercises.forEach((ex) => { const k = nameKey(ex.name); counts[k] = (counts[k] || 0) + 1; });
+      exercises.forEach((ex) => { const n = counts[nameKey(ex.name)]; if (n > 1) ex.dupCount = n; });
       setDraft({ className: null, date: todayStr(), startTime: null, duration: null, workoutType: 'general', exercises });
       setScreen('edit');
     } catch (err) {
@@ -647,20 +691,28 @@ export default function App() {
   function startManual() {
     setPreview(null);
     setDraft({ className: null, date: todayStr(), startTime: null, duration: null, workoutType: 'general',
-      exercises: [{ name: '', modality: 'strength', sets: [emptySet('strength')] }] });
+      exercises: [{ id: uid(), name: '', modality: 'strength', sets: [emptySet('strength')] }] });
     setScreen('edit');
   }
 
   const setDraftField   = (patch) => setDraft((d) => ({ ...d, ...patch }));
   const updateExercise  = (i, patch) => setDraft((d) => ({ ...d, exercises: d.exercises.map((ex, j) => j === i ? { ...ex, ...patch } : ex) }));
-  const addExercise     = () => setDraft((d) => ({ ...d, exercises: [...d.exercises, { name: '', modality: 'strength', sets: [emptySet('strength')] }] }));
+  const addExercise     = () => setDraft((d) => ({ ...d, exercises: [...d.exercises, { id: uid(), name: '', modality: 'strength', sets: [emptySet('strength')] }] }));
   const removeExercise  = (i) => setDraft((d) => ({ ...d, exercises: d.exercises.filter((_, j) => j !== i) }));
   const addSet          = (i) => updateExercise(i, { sets: [...draft.exercises[i].sets, emptySet(draft.exercises[i].modality, draft.exercises[i].sets.at(-1))] });
   const updateSet       = (i, si, patch) => updateExercise(i, { sets: draft.exercises[i].sets.map((s, k) => k === si ? { ...s, ...patch } : s) });
   const removeSet       = (i, si) => updateExercise(i, { sets: draft.exercises[i].sets.filter((_, k) => k !== si) });
 
+  // Any meaningful logged/seeded value (defaults like units and resistance:5 don't count)
+  const setHasData = (s) =>
+    s.reps != null || s.weight != null || s.distance != null || s.seconds != null || s.height != null;
+
   function cycleModality(i) {
     const ex  = draft.exercises[i];
+    if (ex.sets.some(setHasData) &&
+        !window.confirm('Switching the exercise type clears its logged sets. Continue?')) {
+      return;
+    }
     const mod = nextModality(ex.modality);
     updateExercise(i, { modality: mod, sets: ex.sets.map(() => emptySet(mod)) });
   }
@@ -676,9 +728,10 @@ export default function App() {
     await learnAbbrev(cleaned.exercises
       .filter((e) => e.original && e.original !== e.name)
       .map((e) => ({ raw: e.original, name: (e.name || '').trim() })));
-    // Learn modality for any AI-suggested or user-overridden exercises
+    // Learn the FINAL modality for every exercise — including 'strength' — so a
+    // user correction overwrites a stale wrong entry in the learned store.
     await learnModality(cleaned.exercises
-      .filter((e) => e.modality && e.modality !== 'strength')
+      .filter((e) => e.modality)
       .map((e) => ({ name: e.name, modality: e.modality })));
     await saveWorkout(cleaned);
     setDraft(null); setPreview(null);
@@ -691,12 +744,24 @@ export default function App() {
     if (w) {
       const d = w.date ? new Date(w.date) : new Date();
       const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      setDraft({ ...w, date: dateStr });
+      // Backfill ids for stable React keys on data saved before sets carried ids
+      const exercises = (w.exercises || []).map((ex) => ({
+        ...ex, id: ex.id || uid(),
+        sets: (ex.sets || []).map((s) => (s.id ? s : { ...s, id: uid() })),
+      }));
+      setDraft({ ...w, date: dateStr, exercises });
       setPreview(null);
       setScreen('edit');
     }
   }
-  async function remove(id) { await deleteWorkout(id); await refresh(); }
+  async function remove(id) { await deleteWorkout(id); setConfirmId(null); await refresh(); }
+  // First tap arms the delete; second tap (within 3s) performs it.
+  function askRemove(ev, id) {
+    ev.stopPropagation();
+    if (confirmId === id) { remove(id); return; }
+    setConfirmId(id);
+    setTimeout(() => setConfirmId((cur) => (cur === id ? null : cur)), 3000);
+  }
 
   async function openProgress() {
     const ws = await getWorkouts();
@@ -709,6 +774,44 @@ export default function App() {
     setScreen('progress');
   }
   function pickChart(n) { setChartName(n); setChartData(computeProgressData(workouts, n)); }
+
+  // ── Data export / import (Phase 2) ──
+  function downloadFile(filename, content, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  async function onExportJSON() {
+    try {
+      const data = await exportAll();
+      downloadFile(`gym-tracker-backup-${todayStr()}.json`, JSON.stringify(data, null, 2), 'application/json');
+      setDataMsg(`Backup saved — ${data.workouts.length} workout${data.workouts.length === 1 ? '' : 's'}.`);
+    } catch (e) { setDataMsg('Export failed: ' + e.message); }
+  }
+  async function onExportCSV() {
+    try {
+      const csv = await exportCSV();
+      downloadFile(`gym-tracker-export-${todayStr()}.csv`, csv, 'text/csv');
+      setDataMsg('CSV exported.');
+    } catch (e) { setDataMsg('Export failed: ' + e.message); }
+  }
+  async function onImportChosen(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const counts = await importAll(JSON.parse(text));
+      setDataMsg(`Restored ${counts.workouts} workouts, ${counts.abbrevs} names, ${counts.modalities} types.`);
+      await refresh();
+    } catch (err) {
+      setDataMsg('Import failed: ' + (err.message || 'not a valid backup file'));
+    } finally {
+      if (importRef.current) importRef.current.value = '';
+    }
+  }
 
   const num      = (v) => (v === null || v === undefined || v === '' ? '' : v);
   const parseNum = (v) => (v === '' ? null : Number(v));
@@ -724,8 +827,12 @@ export default function App() {
   const secondaryBest  = chartData.length ? Math.max(...chartData.map((d) => d[cfg.secondary] || 0)) : null;
   const totalSessions  = chartData.length;
 
-  // Duration display helper for stat box
-  const fmtStatPrimary = (v) => modality === 'duration' ? fmtSeconds(v) : v;
+  // Stat-box display: durations as m:ss, big numbers (work kg·m, long distances) as k
+  const fmtStatPrimary = (v) => {
+    if (v === null || v === undefined) return v;
+    if (modality === 'duration') return fmtSeconds(v);
+    return v >= 10000 ? `${(v / 1000).toFixed(1)}k` : v;
+  };
 
   return (
     <div style={S.shell}>
@@ -783,6 +890,7 @@ export default function App() {
 
       <input ref={fileRef}   type="file" accept="image/*"                   onChange={onPhotoChosen} style={{ display: 'none' }} />
       <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={onPhotoChosen} style={{ display: 'none' }} />
+      <input ref={importRef} type="file" accept=".json,application/json" onChange={onImportChosen} style={{ display: 'none' }} />
 
       {/* ── HOME ── */}
       {screen === 'home' && (
@@ -813,9 +921,21 @@ export default function App() {
                   {w.duration ? <span style={{ marginLeft: 8 }}>{w.duration}min</span> : ''}
                 </div>
               </div>
-              <button style={S.del} onClick={(ev) => { ev.stopPropagation(); remove(w.id); }}>✕</button>
+              <button
+                style={confirmId === w.id ? { ...S.del, color: '#ff5a6e', fontWeight: 700 } : S.del}
+                onClick={(ev) => askRemove(ev, w.id)}
+              >{confirmId === w.id ? 'sure?' : '✕'}</button>
             </div>
           ))}
+
+          <div style={S.label}>DATA</div>
+          <div style={S.dataRow}>
+            <button style={S.dataBtn} onClick={onExportJSON}>⬇ Backup</button>
+            <button style={S.dataBtn} onClick={onExportCSV}>⬇ CSV</button>
+            <button style={S.dataBtn} onClick={() => importRef.current?.click()}>⬆ Restore</button>
+          </div>
+          {dataMsg && <div style={S.dataMsg}>{dataMsg}</div>}
+          <div style={S.dataNote}>Your data lives in this browser only. Back it up occasionally — clearing browser data wipes it.</div>
         </div>
       )}
 
@@ -889,7 +1009,7 @@ export default function App() {
               headers = ['#', 'reps', 'ht', 'unit', ''];
             }
             return (
-              <div key={i} style={S.card}>
+              <div key={ex.id || i} style={S.card}>
                 <div style={S.cardHead}>
                   <input style={{ ...S.exName, ...(ex.guessed ? S.exNameGuess : {}) }}
                     placeholder="Exercise name" value={ex.name}
@@ -909,6 +1029,9 @@ export default function App() {
                 {mod === 'loaded_distance' && (
                   <div style={S.hintTag}>💡 {isSledType(ex.name) ? 'log total sled weight' : 'log weight per hand'}</div>
                 )}
+                {ex.dupCount > 1 && (
+                  <div style={S.hintTag}>↻ appears {ex.dupCount}× on this board — each is logged separately</div>
+                )}
 
                 {/* Set headers */}
                 <div style={S.setHeader}>
@@ -918,7 +1041,7 @@ export default function App() {
                 </div>
 
                 {ex.sets.map((s, si) => (
-                  <div key={si} style={S.setRow}>
+                  <div key={s.id || si} style={S.setRow}>
                     <span style={S.setNo}>{si + 1}</span>
                     {mod === 'strength'   && <SetRowStrength   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
                     {mod === 'bodyweight' && <SetRowBodyweight s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
@@ -996,7 +1119,7 @@ export default function App() {
                         <ComposedChart data={chartData} margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
                           <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
                           <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
-                          <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} />
+                          <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
                           <YAxis yAxisId="secondary" orientation="right" tick={{ fill: BLUE,      fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
                           <Tooltip content={<CombinedTooltip />} />
                           <Bar  yAxisId="secondary" dataKey={cfg.secondary} fill={BLUE}   opacity={0.45} radius={[3,3,0,0]} />
@@ -1122,4 +1245,8 @@ const S = {
   chartNote:  { fontSize: 11, color: '#6b7080', marginTop: 10, lineHeight: 1.6, padding: '8px 10px', background: '#11131a', borderRadius: 8, border: '1px solid #1d2027' },
   chartLabel: { fontSize: 12, color: '#8b909c', letterSpacing: 1 },
   note:       { fontSize: 11, color: '#6b7080', marginTop: 16, textAlign: 'center' },
+  dataRow:    { display: 'flex', gap: 8 },
+  dataBtn:    { flex: 1, padding: '10px 0', background: 'transparent', border: '1px solid #2a2e38', borderRadius: 8, color: '#8b909c', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  dataMsg:    { fontSize: 11.5, color: '#7fbfa0', marginTop: 10, lineHeight: 1.5 },
+  dataNote:   { fontSize: 10.5, color: '#5a5f6b', marginTop: 10, lineHeight: 1.6 },
 };
