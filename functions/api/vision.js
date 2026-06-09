@@ -9,7 +9,7 @@ export async function onRequestGet({ env }) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 50, messages: [{ role: 'user', content: 'Say hi' }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6, max_tokens: 50, messages: [{ role: 'user', content: 'Say hi' }] }),
     });
     const body = await r.text();
     return new Response(JSON.stringify({ keyLoaded: true, anthropicStatus: r.status, anthropicBody: body }, null, 2), { headers: { 'content-type': 'application/json' } });
@@ -28,7 +28,7 @@ export async function onRequestPost({ request, env }) {
         'x-api-key': env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, messages }),
     });
     const text = await upstream.text();
     return new Response(text, { status: upstream.status, headers: { 'content-type': 'application/json' } });
