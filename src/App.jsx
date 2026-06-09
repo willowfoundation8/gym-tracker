@@ -621,6 +621,49 @@ export default function App() {
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes rise { from { opacity:0; transform: translateY(6px);} to {opacity:1; transform:none;} }
         ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background:#2a2e38; border-radius:3px; }
+
+        /* ── Responsive container ── */
+        .gt-page { max-width: 540px; padding: 26px 18px 70px; }
+        @media (min-width: 480px) { .gt-page { max-width: 680px; padding: 32px 28px 80px; } }
+        @media (min-width: 768px) { .gt-page { max-width: 960px; padding: 44px 48px 100px; } }
+
+        /* ── Fluid typography ── */
+        .gt-h1  { font-size: clamp(34px, 8vw, 56px); }
+        .gt-h2  { font-size: clamp(24px, 5vw, 38px); }
+        .gt-sub { font-size: clamp(12px, 2vw, 15px); }
+
+        /* ── Buttons scale up on desktop ── */
+        @media (min-width: 768px) {
+          .gt-cta   { font-size: 16px !important; padding: 18px !important; }
+          .gt-ghost { font-size: 15px !important; padding: 16px !important; }
+          .gt-row-name { font-size: 20px !important; }
+        }
+
+        /* ── Progress: side-by-side charts on landscape tablet / desktop ── */
+        .gt-chart-grid   { display: flex; flex-direction: column; gap: 16px; }
+        .gt-chart-panel  { flex: 1; min-width: 0; }
+        .gt-chart-height { height: 260px; }
+        .gt-toggle-wrap  { display: block; }
+        @media (min-width: 480px) { .gt-chart-height { height: 300px; } }
+        @media (min-width: 768px) {
+          .gt-chart-grid   { flex-direction: row; align-items: flex-start; }
+          .gt-chart-height { height: 380px; }
+          .gt-toggle-wrap  { display: none; }
+          .gt-chart-panel  { display: block !important; } /* both always visible on desktop */
+        }
+
+        /* ── Edit screen: two-col exercise grid on desktop ── */
+        .gt-exercise-grid { display: contents; }
+        @media (min-width: 768px) {
+          .gt-exercise-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+          .gt-exercise-footer { grid-column: 1 / -1; }
+        }
+
+        /* ── Stat tiles ── */
+        @media (min-width: 768px) {
+          .gt-stat-val { font-size: 28px !important; }
+          .gt-stat-lbl { font-size: 11px !important; letter-spacing: 2px !important; }
+        }
       `}</style>
 
       <input ref={fileRef}   type="file" accept="image/*"                   onChange={onPhotoChosen} style={{ display: 'none' }} />
@@ -628,12 +671,12 @@ export default function App() {
 
       {/* ── HOME ── */}
       {screen === 'home' && (
-        <div style={S.page}>
+        <div style={S.page} className="gt-page">
           <div style={S.kicker}>WORKOUT LOG</div>
-          <h1 style={S.h1}>GYM&nbsp;TRACKER</h1>
-          <div style={S.sub}>{workouts.length} session{workouts.length === 1 ? '' : 's'} · {names.length} exercise{names.length === 1 ? '' : 's'} tracked</div>
-          <button style={S.cta}   onClick={() => setScreen('capture')}>+ NEW WORKOUT</button>
-          <button style={S.ghost} onClick={openProgress}>VIEW PROGRESS</button>
+          <h1 style={S.h1} className="gt-h1">GYM&nbsp;TRACKER</h1>
+          <div style={S.sub} className="gt-sub">{workouts.length} session{workouts.length === 1 ? '' : 's'} · {names.length} exercise{names.length === 1 ? '' : 's'} tracked</div>
+          <button style={S.cta} className="gt-cta" onClick={() => setScreen('capture')}>+ NEW WORKOUT</button>
+          <button style={S.ghost} className="gt-ghost" onClick={openProgress}>VIEW PROGRESS</button>
           <div style={S.label}>HISTORY</div>
           {workouts.length === 0 ? (
             <div style={S.empty}>No workouts yet. Tap "New Workout", snap the board, and log your sets.</div>
@@ -649,7 +692,7 @@ export default function App() {
                     </span>
                   )}
                 </div>
-                <div style={S.rowName}>{w.className || `${w.exercises.length} exercise${w.exercises.length === 1 ? '' : 's'}`}</div>
+                <div style={S.rowName} className="gt-row-name">{w.className || `${w.exercises.length} exercise${w.exercises.length === 1 ? '' : 's'}`}</div>
                 <div style={S.rowMeta}>
                   {w.exercises.slice(0, 3).map((e) => e.name).join(' · ')}{w.exercises.length > 3 ? ' …' : ''}
                   {w.duration ? <span style={{ marginLeft: 8 }}>{w.duration}min</span> : ''}
@@ -663,18 +706,18 @@ export default function App() {
 
       {/* ── CAPTURE ── */}
       {screen === 'capture' && (
-        <div style={S.page}>
+        <div style={S.page} className="gt-page">
           <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
-          <h2 style={S.h2}>NEW WORKOUT</h2>
-          <div style={S.sub}>Snap the board and let AI read the exercises — or enter them yourself.</div>
+          <h2 style={S.h2} className="gt-h2">NEW WORKOUT</h2>
+          <div style={S.sub} className="gt-sub">Snap the board and let AI read the exercises — or enter them yourself.</div>
           {preview && <img src={preview} alt="board" style={S.previewImg} />}
           {busy ? (
             <div style={S.loading}><div style={S.spinner} /> Reading the board…</div>
           ) : (
             <>
-              <button style={S.cta}   onClick={openUpload}>🖼 UPLOAD EXISTING PHOTO</button>
-              <button style={S.ghost} onClick={openCamera}>📷 TAKE A PHOTO</button>
-              <button style={S.ghost} onClick={startManual}>ENTER MANUALLY</button>
+              <button style={S.cta} className="gt-cta" onClick={openUpload}>🖼 UPLOAD EXISTING PHOTO</button>
+              <button style={S.ghost} className="gt-ghost" onClick={openCamera}>📷 TAKE A PHOTO</button>
+              <button style={S.ghost} className="gt-ghost" onClick={startManual}>ENTER MANUALLY</button>
             </>
           )}
           {visionErr && <div style={S.errBox}>{visionErr} <button style={S.inlineBtn} onClick={startManual}>Enter manually →</button></div>}
@@ -683,9 +726,9 @@ export default function App() {
 
       {/* ── EDIT ── */}
       {screen === 'edit' && draft && (
-        <div style={S.page}>
+        <div style={S.page} className="gt-page">
           <button style={S.back} onClick={() => { setScreen('home'); setDraft(null); }}>‹ cancel</button>
-          <h2 style={S.h2}>{draft.id ? 'EDIT WORKOUT' : 'LOG WORKOUT'}</h2>
+          <h2 style={S.h2} className="gt-h2">{draft.id ? 'EDIT WORKOUT' : 'LOG WORKOUT'}</h2>
           {preview && <img src={preview} alt="board" style={S.previewThumb} />}
 
           {/* Date + time row */}
@@ -722,6 +765,7 @@ export default function App() {
             <div style={S.guessBanner}>⚡ Shorthand names were auto-suggested. Tap a highlighted name to fix it, or ✓ to confirm. Once saved, they're remembered.</div>
           )}
 
+          <div className="gt-exercise-grid">
           {draft.exercises.map((ex, i) => {
             const mod = ex.modality || 'strength';
             const headers = SET_HEADERS[mod] || SET_HEADERS.strength;
@@ -767,16 +811,19 @@ export default function App() {
             );
           })}
 
-          <button style={S.ghost} onClick={addExercise}>+ ADD EXERCISE</button>
-          <button style={S.cta}   onClick={save}>SAVE WORKOUT</button>
+          </div>{/* end gt-exercise-grid */}
+          <div className="gt-exercise-footer">
+            <button style={S.ghost} className="gt-ghost" onClick={addExercise}>+ ADD EXERCISE</button>
+            <button style={S.cta} className="gt-cta" onClick={save}>SAVE WORKOUT</button>
+          </div>
         </div>
       )}
 
       {/* ── PROGRESS ── */}
       {screen === 'progress' && (
-        <div style={S.page}>
+        <div style={S.page} className="gt-page">
           <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
-          <h2 style={S.h2}>PROGRESS</h2>
+          <h2 style={S.h2} className="gt-h2">PROGRESS</h2>
           {names.length === 0 ? (
             <div style={S.empty}>Log a few workouts and your exercise trends will show up here.</div>
           ) : (
@@ -791,21 +838,22 @@ export default function App() {
               {chartData.length > 0 && (
                 <div style={S.statRow}>
                   <div style={S.statBox}>
-                    <div style={S.statVal}>{fmtStatPrimary(primaryBest) ?? '—'}<span style={S.statUnit}>{modality === 'duration' ? '' : modality === 'cardio' ? '' : modality === 'distance' ? 'm' : modality === 'bodyweight' ? '' : 'kg'}</span></div>
-                    <div style={S.statLbl}>{cfg.primaryLabel.toUpperCase()}</div>
+                    <div style={S.statVal} className="gt-stat-val">{fmtStatPrimary(primaryBest) ?? '—'}<span style={S.statUnit}>{modality === 'duration' ? '' : modality === 'cardio' ? '' : modality === 'distance' ? 'm' : modality === 'bodyweight' ? '' : 'kg'}</span></div>
+                    <div style={S.statLbl} className="gt-stat-lbl">{cfg.primaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
-                    <div style={S.statVal}>{secondaryBest ?? '—'}<span style={S.statUnit}>{modality === 'distance' || modality === 'cardio' ? 'm' : modality === 'bodyweight' ? '' : modality === 'duration' ? 's' : 'kg'}</span></div>
-                    <div style={S.statLbl}>{cfg.secondaryLabel.toUpperCase()}</div>
+                    <div style={S.statVal} className="gt-stat-val">{secondaryBest ?? '—'}<span style={S.statUnit}>{modality === 'distance' || modality === 'cardio' ? 'm' : modality === 'bodyweight' ? '' : modality === 'duration' ? 's' : 'kg'}</span></div>
+                    <div style={S.statLbl} className="gt-stat-lbl">{cfg.secondaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
-                    <div style={S.statVal}>{totalSessions}</div>
-                    <div style={S.statLbl}>SESSIONS</div>
+                    <div style={S.statVal} className="gt-stat-val">{totalSessions}</div>
+                    <div style={S.statLbl} className="gt-stat-lbl">SESSIONS</div>
                   </div>
                 </div>
               )}
 
-              <div style={S.toggle}>
+              {/* Toggle visible on mobile/portrait only — hidden on desktop via CSS */}
+              <div className="gt-toggle-wrap" style={S.toggle}>
                 <button style={{ ...S.toggleBtn, ...(chartView === 'combined' ? S.toggleOn : {}) }} onClick={() => setChartView('combined')}>COMBINED</button>
                 <button style={{ ...S.toggleBtn, ...(chartView === 'scatter'  ? S.toggleOn : {}) }} onClick={() => setChartView('scatter')}>SCATTER</button>
               </div>
@@ -813,60 +861,58 @@ export default function App() {
               {chartData.length < 2 ? (
                 <div style={S.empty}>Need at least two logged sessions of "{chartName}" to chart a trend.</div>
               ) : (
-                <>
-                  {chartView === 'combined' && (
-                    <>
-                      <div style={S.chartCaption}>
-                        <span style={{ color: ACCENT }}>━</span> {cfg.primaryLabel} &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> {cfg.secondaryLabel}
-                      </div>
-                      <div style={{ height: 260, marginTop: 6 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                          <ComposedChart data={chartData} margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
-                            <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
-                            <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
-                            <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} />
-                            <YAxis yAxisId="secondary" orientation="right" tick={{ fill: BLUE,      fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
-                            <Tooltip content={<CombinedTooltip />} />
-                            <Bar  yAxisId="secondary" dataKey={cfg.secondary} fill={BLUE}   opacity={0.45} radius={[3,3,0,0]} />
-                            <Line yAxisId="primary"   dataKey={cfg.primary}   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} connectNulls />
-                          </ComposedChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div style={S.chartNote}>{cfg.note}</div>
-                    </>
-                  )}
+                <div className="gt-chart-grid">
 
-                  {chartView === 'scatter' && (
-                    <>
-                      <div style={S.chartCaption}>
-                        {modality === 'cardio'
-                          ? 'Each dot = one set. Y = distance. Dot size = resistance level.'
-                          : modality === 'strength'
-                          ? 'Each dot = one set. Y = weight. Dot size = rep count.'
-                          : 'Each dot = one set. Y = primary metric over time.'}
-                      </div>
-                      <div style={{ height: 260, marginTop: 6 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                          <ScatterChart margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
-                            <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
-                            <XAxis dataKey="label" type="category" allowDuplicatedCategory={false} tick={{ fill: '#8b909c', fontSize: 11 }} name="Date" />
-                            <YAxis dataKey="weight" tick={{ fill: '#8b909c', fontSize: 11 }} width={38} name="Value" />
-                            <ZAxis dataKey="z" range={[40, 300]} name="Size" />
-                            <Tooltip content={<ScatterTooltip />} />
-                            <Scatter data={scatterPoints} fill={ACCENT} fillOpacity={0.75} />
-                          </ScatterChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div style={S.chartNote}>
-                        {modality === 'strength'   && 'Bigger dots = more reps. High small dot = heavy low-rep set. Low big dot = high-volume set.'}
-                        {modality === 'bodyweight' && 'Each dot is one set. Y = rep count.'}
-                        {modality === 'distance'   && 'Each dot is one set. Y = distance covered.'}
-                        {modality === 'duration'   && 'Each dot is one set. Y = hold duration in seconds.'}
-                        {modality === 'cardio'     && 'Each dot is one set. Y = distance. Bigger dot = higher resistance.'}
-                      </div>
-                    </>
-                  )}
-                </>
+                  {/* ── COMBINED — always rendered, hidden on mobile if toggle is scatter ── */}
+                  <div className="gt-chart-panel" style={chartView !== 'combined' ? { display: 'none' } : {}}>
+                    <div style={S.chartCaption}>
+                      <span style={{ color: ACCENT }}>━</span> {cfg.primaryLabel} &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> {cfg.secondaryLabel}
+                    </div>
+                    <div className="gt-chart-height" style={{ marginTop: 6 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <ComposedChart data={chartData} margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
+                          <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
+                          <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
+                          <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} />
+                          <YAxis yAxisId="secondary" orientation="right" tick={{ fill: BLUE,      fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                          <Tooltip content={<CombinedTooltip />} />
+                          <Bar  yAxisId="secondary" dataKey={cfg.secondary} fill={BLUE}   opacity={0.45} radius={[3,3,0,0]} />
+                          <Line yAxisId="primary"   dataKey={cfg.primary}   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} connectNulls />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={S.chartNote}>{cfg.note}</div>
+                  </div>
+
+                  {/* ── SCATTER — always rendered, hidden on mobile if toggle is combined ── */}
+                  <div className="gt-chart-panel" style={chartView !== 'scatter' ? { display: 'none' } : {}}>
+                    <div style={S.chartCaption}>
+                      {modality === 'cardio'   ? 'Each dot = one set. Y = distance. Dot size = resistance.'
+                     : modality === 'strength' ? 'Each dot = one set. Y = weight. Dot size = rep count.'
+                     : 'Each dot = one set. Y = primary metric over time.'}
+                    </div>
+                    <div className="gt-chart-height" style={{ marginTop: 6 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <ScatterChart margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
+                          <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
+                          <XAxis dataKey="label" type="category" allowDuplicatedCategory={false} tick={{ fill: '#8b909c', fontSize: 11 }} name="Date" />
+                          <YAxis dataKey="weight" tick={{ fill: '#8b909c', fontSize: 11 }} width={38} name="Value" />
+                          <ZAxis dataKey="z" range={[40, 300]} name="Size" />
+                          <Tooltip content={<ScatterTooltip />} />
+                          <Scatter data={scatterPoints} fill={ACCENT} fillOpacity={0.75} />
+                        </ScatterChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={S.chartNote}>
+                      {modality === 'strength'   && 'Bigger dots = more reps. High small dot = heavy low-rep set. Low big dot = high-volume set.'}
+                      {modality === 'bodyweight' && 'Each dot is one set. Y = rep count.'}
+                      {modality === 'distance'   && 'Each dot is one set. Y = distance covered.'}
+                      {modality === 'duration'   && 'Each dot is one set. Y = hold duration in seconds.'}
+                      {modality === 'cardio'     && 'Each dot is one set. Y = distance. Bigger dot = higher resistance.'}
+                    </div>
+                  </div>
+
+                </div>
               )}
               <div style={S.note}>Next up (v1.1): personal records and streaks.</div>
             </>
@@ -884,9 +930,9 @@ const S = {
   shell:      { background: '#0c0d10', color: '#e7e9ee', minHeight: '100vh', fontFamily: "'IBM Plex Mono', ui-monospace, monospace" },
   page:       { maxWidth: 540, margin: '0 auto', padding: '26px 18px 70px', animation: 'rise .25s ease' },
   kicker:     { fontSize: 11, letterSpacing: 3, color: ACCENT, fontWeight: 500 },
-  h1:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 44, lineHeight: 1, margin: '6px 0 8px', letterSpacing: 1 },
-  h2:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 30, margin: '4px 0 6px', letterSpacing: 1 },
-  sub:        { fontSize: 12.5, color: '#8b909c', marginBottom: 22, lineHeight: 1.5 },
+  h1:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, lineHeight: 1, margin: '6px 0 8px', letterSpacing: 1 },
+  h2:         { fontFamily: "'Oswald', sans-serif", fontWeight: 700, margin: '4px 0 6px', letterSpacing: 1 },
+  sub:        { color: '#8b909c', marginBottom: 22, lineHeight: 1.5 },
   cta:        { width: '100%', padding: '15px', background: ACCENT, color: '#0c0d10', border: 'none', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 15, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
   ghost:      { width: '100%', padding: '13px', background: 'transparent', color: '#cfd3dc', border: '1px solid #2a2e38', borderRadius: 10, fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 14, letterSpacing: 1, cursor: 'pointer', marginBottom: 10 },
   label:      { fontSize: 11, letterSpacing: 2, color: '#8b909c', margin: '24px 0 10px' },
