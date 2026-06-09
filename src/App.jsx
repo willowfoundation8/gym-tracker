@@ -1,19 +1,137 @@
 // src/App.jsx — deployed version. Storage comes from ./db (Dexie); AI calls go
 // through your Cloudflare Worker proxy (/api/vision, /api/expand) so your
-// Anthropic key stays server-side. UI is identical to the artifact build.
+// Anthropic key stays server-side.
 
 import { useState, useEffect, useRef } from 'react';
 import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ScatterChart, Scatter, ZAxis, Legend,
+  ResponsiveContainer, ScatterChart, Scatter, ZAxis,
 } from 'recharts';
 import {
   getWorkouts, getWorkout, saveWorkout, deleteWorkout,
   getExerciseNames, getAbbrevMap, learnAbbrev, nameKey,
+  getModalityMap, learnModality,
 } from './db';
 
 /* ===========================================================================
-   IMAGE + VISION — calls go to YOUR Worker proxy, not Anthropic directly.
+   MODALITY — seed dictionary + helpers
+   Lookup order: seed dict → learned store → AI suggestion → 'strength'
+=========================================================================== */
+const MODALITIES = ['strength', 'bodyweight', 'distance', 'duration', 'cardio'];
+
+const MODALITY_LABELS = {
+  strength:   '🏋 Strength',
+  bodyweight: '💪 Bodyweight',
+  distance:   '📏 Distance',
+  duration:   '⏱ Duration',
+  cardio:     '🚣 Cardio',
+};
+
+// Canonical exercise name (post-expansion, lower-trimmed) → modality
+const MODALITY_SEED = {
+  // ── Distance ──────────────────────────────────────────────────────────────
+  'sled push':             'distance',
+  'sled pull':             'distance',
+  'farmers carry':         'distance',
+  'farmers walk':          'distance',
+  'waiters walk':          'distance',
+  'waiter carry':          'distance',
+  'prowler push':          'distance',
+  'sandbag carry':         'distance',
+  'bear crawl':            'distance',
+  'sprint':                'distance',
+  'run':                   'distance',
+  'treadmill run':         'distance',
+  'treadmill sprint':      'distance',
+  // ── Duration ──────────────────────────────────────────────────────────────
+  'plank':                 'duration',
+  'side plank':            'duration',
+  'wall sit':              'duration',
+  'dead hang':             'duration',
+  'l-sit':                 'duration',
+  'hollow hold':           'duration',
+  'arch hold':             'duration',
+  'static lunge hold':     'duration',
+  'isometric squat hold':  'duration',
+  // ── Bodyweight ────────────────────────────────────────────────────────────
+  'push-up':               'bodyweight',
+  'push up':               'bodyweight',
+  'pull-up':               'bodyweight',
+  'pull up':               'bodyweight',
+  'chin-up':               'bodyweight',
+  'chin up':               'bodyweight',
+  'dip':                   'bodyweight',
+  'burpee':                'bodyweight',
+  'box jump':              'bodyweight',
+  'jump squat':            'bodyweight',
+  'tuck jump':             'bodyweight',
+  'mountain climber':      'bodyweight',
+  'sit-up':                'bodyweight',
+  'sit up':                'bodyweight',
+  'v-up':                  'bodyweight',
+  'v up':                  'bodyweight',
+  'jumping jack':          'bodyweight',
+  'broad jump':            'bodyweight',
+  'lateral bound':         'bodyweight',
+  'skater jump':           'bodyweight',
+  'step up':               'bodyweight',
+  'bodyweight squat':      'bodyweight',
+  'air squat':             'bodyweight',
+  'inchworm':              'bodyweight',
+  'bear crawl':            'bodyweight',
+  // ── Cardio (machine-based) ────────────────────────────────────────────────
+  'row':                   'cardio',
+  'rowing':                'cardio',
+  'ski erg':               'cardio',
+  'skierg':                'cardio',
+  'assault bike':          'cardio',
+  'echo bike':             'cardio',
+  'air bike':              'cardio',
+  'concept2 row':          'cardio',
+  'c2 row':                'cardio',
+  'bike erg':              'cardio',
+  'rower':                 'cardio',
+  'cycle':                 'cardio',
+  'spin bike':             'cardio',
+};
+
+function seedModality(canonicalName) {
+  return MODALITY_SEED[nameKey(canonicalName)] || null;
+}
+
+function nextModality(current) {
+  const i = MODALITIES.indexOf(current);
+  return MODALITIES[(i + 1) % MODALITIES.length];
+}
+
+// Default empty set shape per modality
+function emptySet(modality, ref) {
+  const unit = ref?.weightUnit || 'kg';
+  const distUnit = ref?.distUnit || 'm';
+  switch (modality) {
+    case 'bodyweight': return { reps: null, weight: null, weightUnit: unit };
+    case 'distance':   return { distance: null, distUnit };
+    case 'duration':   return { seconds: null };
+    case 'cardio':     return { distance: null, distUnit, seconds: null, resistance: 5 };
+    default:           return { reps: null, weight: null, weightUnit: unit };  // strength
+  }
+}
+
+/* ===========================================================================
+   WORKOUT TYPES
+=========================================================================== */
+const WORKOUT_TYPES = ['general', 'strength', 'hiit', 'cardio', 'warmup', 'recovery'];
+const WORKOUT_TYPE_LABELS = {
+  general:   '⚡ General',
+  strength:  '🏋 Strength',
+  hiit:      '🔥 HIIT',
+  cardio:    '🚴 Cardio',
+  warmup:    '🌅 Warmup',
+  recovery:  '🧘 Recovery',
+};
+
+/* ===========================================================================
+   IMAGE + VISION
 =========================================================================== */
 async function fileToImage(file, maxDim = 1024) {
   const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
@@ -31,10 +149,13 @@ async function fileToImage(file, maxDim = 1024) {
 async function extractExercises(base64) {
   const prompt =
     'You are reading a gym workout board from a photo. Extract the list of exercises. ' +
-    'For each "name", use the EXACT text as written on the board, including any abbreviations or shorthand (do not expand them yourself). ' +
+    'For each "name", use the EXACT text as written on the board (do not expand abbreviations). ' +
+    'Also suggest the exercise modality based on the name: ' +
+    '"strength" (weighted reps), "bodyweight" (reps, no load), ' +
+    '"distance" (sled, carry, run), "duration" (plank, holds), "cardio" (rower, ski erg, bike). ' +
     'Respond with ONLY a JSON array, no prose, no markdown fences. Each item: ' +
-    '{"name": string, "suggestedSets": number|null, "suggestedReps": number|null}. ' +
-    "If a value isn't shown on the board, use null. Preserve the order they appear on the board.";
+    '{"name": string, "suggestedSets": number|null, "suggestedReps": number|null, "modality": string}. ' +
+    "If sets/reps aren't shown use null. Default modality to \"strength\" if unsure. Preserve board order.";
   const res = await fetch('/api/vision', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -48,7 +169,12 @@ async function extractExercises(base64) {
   const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
   const arr = JSON.parse(clean);
-  return arr.map((x) => ({ raw: (x.name || 'Exercise').trim(), suggestedSets: x.suggestedSets ?? null, suggestedReps: x.suggestedReps ?? null }));
+  return arr.map((x) => ({
+    raw:          (x.name || 'Exercise').trim(),
+    suggestedSets: x.suggestedSets ?? null,
+    suggestedReps: x.suggestedReps ?? null,
+    aiModality:   MODALITIES.includes(x.modality) ? x.modality : 'strength',
+  }));
 }
 
 async function expandViaAI(rawList) {
@@ -69,7 +195,6 @@ async function expandViaAI(rawList) {
   return JSON.parse(clean);
 }
 
-// Resolve raw board names to full names: learned cache first, model for unknowns.
 async function resolveNames(rawList) {
   const map = await getAbbrevMap();
   const unknown = rawList.filter((raw) => !map[nameKey(raw)]);
@@ -89,14 +214,32 @@ async function resolveNames(rawList) {
 }
 
 /* ===========================================================================
-   PROGRESS METRICS — computed client-side from raw workout data
-   Epley e1RM formula: weight × (1 + reps / 30)
-   Volume Load: sum of (sets × reps × weight) across all sets
+   PROGRESS METRICS
 =========================================================================== */
 function epley(weight, reps) {
   if (!weight || !reps || weight <= 0 || reps <= 0) return null;
-  if (reps === 1) return weight; // 1RM is the weight itself
+  if (reps === 1) return weight;
   return Math.round(weight * (1 + reps / 30));
+}
+
+// mm:ss display from total seconds
+function fmtSeconds(s) {
+  if (!s && s !== 0) return '—';
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+// Parse "mm:ss" or plain seconds string → integer seconds
+function parseSeconds(v) {
+  if (!v && v !== 0) return null;
+  const str = String(v).trim();
+  if (str.includes(':')) {
+    const [m, s] = str.split(':').map(Number);
+    return (m || 0) * 60 + (s || 0);
+  }
+  const n = Number(str);
+  return isNaN(n) ? null : n;
 }
 
 function computeProgressData(workouts, exerciseName) {
@@ -106,68 +249,95 @@ function computeProgressData(workouts, exerciseName) {
   for (const w of workouts) {
     const ex = w.exercises.find((e) => nameKey(e.name) === key);
     if (!ex) continue;
-
-    const validSets = ex.sets.filter((s) => s.weight > 0 && s.reps > 0);
-    if (!validSets.length) continue;
-
-    // e1RM: best across all sets in this session
-    const bestE1rm = validSets.reduce((best, s) => {
-      const v = epley(s.weight, s.reps);
-      return v > best ? v : best;
-    }, 0);
-
-    // Volume load: total work done this session
-    const volume = validSets.reduce((sum, s) => sum + s.weight * s.reps, 0);
-
-    // Top set weight (heaviest single set)
-    const topWeight = Math.max(...validSets.map((s) => s.weight));
-
-    // Total reps across all sets
-    const totalReps = validSets.reduce((sum, s) => sum + s.reps, 0);
-    const totalSets = validSets.length;
-
+    const modality = ex.modality || 'strength';
+    const sets = ex.sets || [];
     const label = new Date(w.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const base = { date: w.date, label, modality };
 
-    sessions.push({
-      date: w.date,
-      label,
-      e1rm: bestE1rm || null,
-      volume: Math.round(volume),
-      topWeight,
-      totalReps,
-      totalSets,
-      // For scatter: each valid set becomes its own point
-      scatterSets: validSets.map((s) => ({
-        date: w.date,
-        label,
-        weight: s.weight,
-        reps: s.reps,
-        // Bubble size = reps (scaled); ZAxis handles the visual scaling
-        z: s.reps,
-      })),
-    });
+    if (modality === 'strength') {
+      const valid = sets.filter((s) => s.weight > 0 && s.reps > 0);
+      if (!valid.length) continue;
+      const bestE1rm  = valid.reduce((b, s) => Math.max(b, epley(s.weight, s.reps) || 0), 0);
+      const volume    = valid.reduce((sum, s) => sum + s.weight * s.reps, 0);
+      const topWeight = Math.max(...valid.map((s) => s.weight));
+      const totalReps = valid.reduce((sum, s) => sum + s.reps, 0);
+      sessions.push({
+        ...base,
+        e1rm: bestE1rm || null,
+        volume: Math.round(volume),
+        topWeight, totalReps,
+        totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.weight, reps: s.reps, z: s.reps })),
+      });
+
+    } else if (modality === 'bodyweight') {
+      const valid = sets.filter((s) => s.reps > 0);
+      if (!valid.length) continue;
+      const maxReps   = Math.max(...valid.map((s) => s.reps));
+      const totalReps = valid.reduce((sum, s) => sum + s.reps, 0);
+      sessions.push({ ...base, maxReps, totalReps, totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.reps, reps: s.reps, z: s.reps })) });
+
+    } else if (modality === 'distance') {
+      const valid = sets.filter((s) => s.distance > 0);
+      if (!valid.length) continue;
+      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
+      const bestDist  = Math.max(...valid.map((s) => s.distance));
+      sessions.push({ ...base, totalDist, bestDist, totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.distance, reps: 1, z: 20 })) });
+
+    } else if (modality === 'duration') {
+      const valid = sets.filter((s) => s.seconds > 0);
+      if (!valid.length) continue;
+      const bestSeconds = Math.max(...valid.map((s) => s.seconds));
+      const totalSeconds = valid.reduce((sum, s) => sum + s.seconds, 0);
+      sessions.push({ ...base, bestSeconds, totalSeconds, totalSets: valid.length,
+        scatterSets: valid.map((s) => ({ date: w.date, label, weight: s.seconds, reps: 1, z: 20 })) });
+
+    } else if (modality === 'cardio') {
+      // Effort score: (distance / time_s) × (1 + resistance / 20)
+      const valid = sets.filter((s) => s.distance > 0 && s.seconds > 0);
+      if (!valid.length) continue;
+      const bestEffort = valid.reduce((best, s) => {
+        const pace = s.distance / s.seconds;
+        const effort = pace * (1 + (s.resistance || 0) / 20);
+        return effort > best ? effort : best;
+      }, 0);
+      const totalDist = valid.reduce((sum, s) => sum + s.distance, 0);
+      sessions.push({ ...base,
+        effort: Math.round(bestEffort * 1000) / 1000,
+        totalDist, totalSets: valid.length,
+        scatterSets: valid.map((s) => ({
+          date: w.date, label,
+          weight: s.distance,
+          reps: s.resistance || 0,
+          z: Math.max(20, (s.resistance || 0) * 20),
+        })),
+      });
+    }
   }
 
-  // Sort chronologically
   sessions.sort((a, b) => new Date(a.date) - new Date(b.date));
   return sessions;
 }
 
 /* ===========================================================================
-   CUSTOM TOOLTIP COMPONENTS
+   CUSTOM TOOLTIPS
 =========================================================================== */
 function CombinedTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
   const d = payload[0]?.payload;
   if (!d) return null;
+  const mod = d.modality || 'strength';
   return (
     <div style={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, padding: '10px 13px', fontSize: 12, lineHeight: 1.8 }}>
       <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{label}</div>
-      {d.e1rm   && <div style={{ color: '#d7ff32' }}>e1RM: <b>{d.e1rm} kg</b></div>}
-      {d.volume && <div style={{ color: '#6b9fff' }}>Volume: <b>{d.volume} kg</b></div>}
-      <div style={{ color: '#8b909c', marginTop: 4, borderTop: '1px solid #2a2e38', paddingTop: 4 }}>
-        {d.totalSets} sets · {d.totalReps} reps · top {d.topWeight} kg
-      </div>
+      {mod === 'strength'   && <><div style={{ color: '#d7ff32'  }}>e1RM: <b>{d.e1rm} kg</b></div><div style={{ color: '#6b9fff' }}>Volume: <b>{d.volume} kg</b></div></>}
+      {mod === 'bodyweight' && <><div style={{ color: '#d7ff32'  }}>Max reps: <b>{d.maxReps}</b></div><div style={{ color: '#6b9fff' }}>Total reps: <b>{d.totalReps}</b></div></>}
+      {mod === 'distance'   && <><div style={{ color: '#d7ff32'  }}>Best set: <b>{d.bestDist} m</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{d.totalDist} m</b></div></>}
+      {mod === 'duration'   && <><div style={{ color: '#d7ff32'  }}>Best hold: <b>{fmtSeconds(d.bestSeconds)}</b></div><div style={{ color: '#6b9fff' }}>Total: <b>{fmtSeconds(d.totalSeconds)}</b></div></>}
+      {mod === 'cardio'     && <><div style={{ color: '#d7ff32'  }}>Effort score: <b>{d.effort}</b></div><div style={{ color: '#6b9fff' }}>Distance: <b>{d.totalDist} m</b></div></>}
+      <div style={{ color: '#8b909c', marginTop: 4, borderTop: '1px solid #2a2e38', paddingTop: 4 }}>{d.totalSets} set{d.totalSets !== 1 ? 's' : ''}</div>
     </div>
   );
 }
@@ -179,37 +349,140 @@ function ScatterTooltip({ active, payload }) {
   return (
     <div style={{ background: '#13151b', border: '1px solid #2a2e38', borderRadius: 8, padding: '10px 13px', fontSize: 12, lineHeight: 1.8 }}>
       <div style={{ color: '#d7ff32', fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
-      <div style={{ color: '#e7e9ee' }}>{d.weight} kg × {d.reps} reps</div>
-      <div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div>
+      <div style={{ color: '#e7e9ee' }}>{d.weight} × {d.reps}</div>
+      {d.reps > 0 && d.weight > 0 && <div style={{ color: '#8b909c' }}>e1RM ≈ {epley(d.weight, d.reps)} kg</div>}
     </div>
   );
 }
 
 /* ===========================================================================
-   UI
+   CHART METRIC CONFIG per modality
+=========================================================================== */
+const CHART_CONFIG = {
+  strength:   { primary: 'e1rm',       primaryLabel: 'e1RM (kg)',     secondary: 'volume',      secondaryLabel: 'Volume (kg)',  note: 'e1RM normalises any set to a "max effort" number — heavy singles and volume sets become comparable.' },
+  bodyweight: { primary: 'maxReps',    primaryLabel: 'Max reps',      secondary: 'totalReps',   secondaryLabel: 'Total reps',   note: 'Max reps is the best single set. Total reps shows overall volume done that session.' },
+  distance:   { primary: 'bestDist',   primaryLabel: 'Best set (m)',  secondary: 'totalDist',   secondaryLabel: 'Total dist (m)', note: 'Best set distance per session. Total shows cumulative work done.' },
+  duration:   { primary: 'bestSeconds',primaryLabel: 'Best hold (s)', secondary: 'totalSeconds',secondaryLabel: 'Total (s)',     note: 'Best single hold duration per session in seconds.' },
+  cardio:     { primary: 'effort',     primaryLabel: 'Effort score',  secondary: 'totalDist',   secondaryLabel: 'Distance (m)', note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },
+};
+
+/* ===========================================================================
+   SET ROW COMPONENTS
+=========================================================================== */
+function SetRowStrength({ s, si, onUpdate, onRemove, num, parseNum }) {
+  return (
+    <>
+      <input style={S.setInput} type="number" inputMode="numeric"  placeholder="–" value={num(s.reps)}   onChange={(e) => onUpdate({ reps:   parseNum(e.target.value) })} />
+      <input style={S.setInput} type="number" inputMode="decimal"  placeholder="–" value={num(s.weight)} onChange={(e) => onUpdate({ weight: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
+    </>
+  );
+}
+
+function SetRowBodyweight({ s, onUpdate, onRemove, num, parseNum }) {
+  return (
+    <>
+      <input style={{ ...S.setInput, flex: 2 }} type="number" inputMode="numeric" placeholder="reps" value={num(s.reps)} onChange={(e) => onUpdate({ reps: parseNum(e.target.value) })} />
+      <input style={S.setInput} type="number" inputMode="decimal" placeholder="+wt" value={num(s.weight)} onChange={(e) => onUpdate({ weight: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
+    </>
+  );
+}
+
+function SetRowDistance({ s, onUpdate, num, parseNum }) {
+  return (
+    <>
+      <input style={{ ...S.setInput, flex: 2 }} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
+    </>
+  );
+}
+
+function SetRowDuration({ s, onUpdate, num }) {
+  // Store as integer seconds; display/edit as mm:ss
+  const toDisplay = (sec) => {
+    if (!sec && sec !== 0) return '';
+    return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+  };
+  const [raw, setRaw] = useState(toDisplay(s.seconds));
+  useEffect(() => { setRaw(toDisplay(s.seconds)); }, [s.seconds]);
+  return (
+    <input
+      style={{ ...S.setInput, flex: 2 }}
+      type="text"
+      inputMode="numeric"
+      placeholder="mm:ss"
+      value={raw}
+      onChange={(e) => setRaw(e.target.value)}
+      onBlur={() => { const sec = parseSeconds(raw); if (sec !== null) onUpdate({ seconds: sec }); }}
+    />
+  );
+}
+
+function SetRowCardio({ s, onUpdate, num, parseNum }) {
+  const toDisplay = (sec) => {
+    if (!sec && sec !== 0) return '';
+    return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+  };
+  const [rawTime, setRawTime] = useState(toDisplay(s.seconds));
+  useEffect(() => { setRawTime(toDisplay(s.seconds)); }, [s.seconds]);
+  const res = s.resistance ?? 5;
+  return (
+    <>
+      <input style={S.setInput} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
+      <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
+      <input
+        style={S.setInput}
+        type="text"
+        inputMode="numeric"
+        placeholder="mm:ss"
+        value={rawTime}
+        onChange={(e) => setRawTime(e.target.value)}
+        onBlur={() => { const sec = parseSeconds(rawTime); if (sec !== null) onUpdate({ seconds: sec }); }}
+      />
+      {/* Resistance stepper */}
+      <div style={S.stepper}>
+        <button style={S.stepBtn} onClick={() => onUpdate({ resistance: Math.max(1, res - 1) })}>−</button>
+        <span style={S.stepVal}>{res}</span>
+        <button style={S.stepBtn} onClick={() => onUpdate({ resistance: Math.min(10, res + 1) })}>+</button>
+      </div>
+    </>
+  );
+}
+
+/* Column header labels per modality */
+const SET_HEADERS = {
+  strength:   ['#', 'reps', 'weight', 'unit', ''],
+  bodyweight: ['#', 'reps', '+wt', 'unit', ''],
+  distance:   ['#', 'distance', 'unit', ''],
+  duration:   ['#', 'time (mm:ss)', ''],
+  cardio:     ['#', 'dist', 'unit', 'time', 'resist', ''],
+};
+
+/* ===========================================================================
+   MAIN APP
 =========================================================================== */
 const ACCENT = '#d7ff32';
 const BLUE   = '#6b9fff';
 
 export default function App() {
-  const [screen, setScreen] = useState('home');
+  const [screen, setScreen]     = useState('home');
   const [workouts, setWorkouts] = useState([]);
-  const [names, setNames] = useState([]);
-  const [draft, setDraft] = useState(null);
-  const [preview, setPreview] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const [names, setNames]       = useState([]);
+  const [draft, setDraft]       = useState(null);
+  const [preview, setPreview]   = useState(null);
+  const [busy, setBusy]         = useState(false);
   const [visionErr, setVisionErr] = useState(null);
   const [chartName, setChartName] = useState(null);
-  const [chartData, setChartData] = useState([]);   // array of session objects
-  const [chartView, setChartView] = useState('combined'); // 'combined' | 'scatter'
-  const fileRef = useRef(null);
+  const [chartData, setChartData] = useState([]);
+  const [chartView, setChartView] = useState('combined');
+  const fileRef   = useRef(null);
   const cameraRef = useRef(null);
 
   async function refresh() {
     const ws = await getWorkouts();
     setWorkouts(ws);
     setNames(await getExerciseNames());
-    // If a chart is already selected, recompute from fresh data
     if (chartName) setChartData(computeProgressData(ws, chartName));
   }
   useEffect(() => { refresh(); }, []);
@@ -226,22 +499,27 @@ export default function App() {
       setPreview(preview);
       const read = await extractExercises(base64);
       const resolved = await resolveNames(read.map((r) => r.raw));
+      // Load learned modality map once for all exercises
+      const modalityMap = await getModalityMap();
       const exercises = resolved.map((r, i) => {
+        // Modality lookup: seed → learned → AI → fallback
+        const canonical = r.name;
+        const modality =
+          seedModality(canonical) ||
+          modalityMap[nameKey(canonical)] ||
+          read[i].aiModality ||
+          'strength';
         const count = read[i].suggestedSets ?? 1;
-        const sets = Array.from({ length: Math.max(1, count) }, () => ({
-          reps: read[i].suggestedReps ?? null,
-          weight: null,
-          weightUnit: 'kg',
-        }));
-        return {
-          name: r.name,
-          original: r.original,
-          status: r.status,
-          guessed: r.status !== 'remembered',
-          sets,
-        };
+        const sets = Array.from({ length: Math.max(1, count) }, () => {
+          const s = emptySet(modality);
+          if (modality === 'strength' || modality === 'bodyweight') {
+            s.reps = read[i].suggestedReps ?? null;
+          }
+          return s;
+        });
+        return { name: canonical, original: r.original, status: r.status, guessed: r.status !== 'remembered', modality, sets };
       });
-      setDraft({ className: null, date: todayStr(), exercises });
+      setDraft({ className: null, date: todayStr(), startTime: null, duration: null, workoutType: 'general', exercises });
       setScreen('edit');
     } catch (err) {
       setVisionErr("Couldn't read the board automatically — you can enter it by hand.");
@@ -253,17 +531,24 @@ export default function App() {
 
   function startManual() {
     setPreview(null);
-    setDraft({ className: null, date: todayStr(), exercises: [{ name: '', sets: [{ reps: null, weight: null, weightUnit: 'kg' }] }] });
+    setDraft({ className: null, date: todayStr(), startTime: null, duration: null, workoutType: 'general',
+      exercises: [{ name: '', modality: 'strength', sets: [emptySet('strength')] }] });
     setScreen('edit');
   }
 
-  const setDraftField = (patch) => setDraft((d) => ({ ...d, ...patch }));
-  const updateExercise = (i, patch) => setDraft((d) => ({ ...d, exercises: d.exercises.map((ex, j) => (j === i ? { ...ex, ...patch } : ex)) }));
-  const addExercise = () => setDraft((d) => ({ ...d, exercises: [...d.exercises, { name: '', sets: [{ reps: null, weight: null, weightUnit: 'kg' }] }] }));
-  const removeExercise = (i) => setDraft((d) => ({ ...d, exercises: d.exercises.filter((_, j) => j !== i) }));
-  const addSet = (i) => updateExercise(i, { sets: [...draft.exercises[i].sets, { reps: null, weight: null, weightUnit: draft.exercises[i].sets.at(-1)?.weightUnit || 'kg' }] });
-  const updateSet = (i, si, patch) => updateExercise(i, { sets: draft.exercises[i].sets.map((s, k) => (k === si ? { ...s, ...patch } : s)) });
-  const removeSet = (i, si) => updateExercise(i, { sets: draft.exercises[i].sets.filter((_, k) => k !== si) });
+  const setDraftField   = (patch) => setDraft((d) => ({ ...d, ...patch }));
+  const updateExercise  = (i, patch) => setDraft((d) => ({ ...d, exercises: d.exercises.map((ex, j) => j === i ? { ...ex, ...patch } : ex) }));
+  const addExercise     = () => setDraft((d) => ({ ...d, exercises: [...d.exercises, { name: '', modality: 'strength', sets: [emptySet('strength')] }] }));
+  const removeExercise  = (i) => setDraft((d) => ({ ...d, exercises: d.exercises.filter((_, j) => j !== i) }));
+  const addSet          = (i) => updateExercise(i, { sets: [...draft.exercises[i].sets, emptySet(draft.exercises[i].modality, draft.exercises[i].sets.at(-1))] });
+  const updateSet       = (i, si, patch) => updateExercise(i, { sets: draft.exercises[i].sets.map((s, k) => k === si ? { ...s, ...patch } : s) });
+  const removeSet       = (i, si) => updateExercise(i, { sets: draft.exercises[i].sets.filter((_, k) => k !== si) });
+
+  function cycleModality(i) {
+    const ex  = draft.exercises[i];
+    const mod = nextModality(ex.modality);
+    updateExercise(i, { modality: mod, sets: ex.sets.map(() => emptySet(mod)) });
+  }
 
   async function save() {
     const cleaned = { ...draft, exercises: draft.exercises.filter((ex) => (ex.name || '').trim()) };
@@ -273,7 +558,13 @@ export default function App() {
     } else {
       cleaned.date = new Date().toISOString();
     }
-    await learnAbbrev(cleaned.exercises.filter((e) => e.original && e.original !== e.name).map((e) => ({ raw: e.original, name: (e.name || '').trim() })));
+    await learnAbbrev(cleaned.exercises
+      .filter((e) => e.original && e.original !== e.name)
+      .map((e) => ({ raw: e.original, name: (e.name || '').trim() })));
+    // Learn modality for any AI-suggested or user-overridden exercises
+    await learnModality(cleaned.exercises
+      .filter((e) => e.modality && e.modality !== 'strength')
+      .map((e) => ({ name: e.name, modality: e.modality })));
     await saveWorkout(cleaned);
     setDraft(null); setPreview(null);
     await refresh();
@@ -290,10 +581,7 @@ export default function App() {
       setScreen('edit');
     }
   }
-  async function remove(id) {
-    await deleteWorkout(id);
-    await refresh();
-  }
+  async function remove(id) { await deleteWorkout(id); await refresh(); }
 
   async function openProgress() {
     const ws = await getWorkouts();
@@ -305,26 +593,24 @@ export default function App() {
     setChartData(first ? computeProgressData(ws, first) : []);
     setScreen('progress');
   }
+  function pickChart(n) { setChartName(n); setChartData(computeProgressData(workouts, n)); }
 
-  function pickChart(n) {
-    setChartName(n);
-    setChartData(computeProgressData(workouts, n));
-  }
-
-  const num = (v) => (v === null || v === undefined || v === '' ? '' : v);
+  const num      = (v) => (v === null || v === undefined || v === '' ? '' : v);
   const parseNum = (v) => (v === '' ? null : Number(v));
   function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
-  // Flatten all per-set scatter points from all sessions for the scatter chart
-  const scatterPoints = chartData.flatMap((s) => s.scatterSets || []);
+  const scatterPoints  = chartData.flatMap((s) => s.scatterSets || []);
+  const modality       = chartData[0]?.modality || 'strength';
+  const cfg            = CHART_CONFIG[modality] || CHART_CONFIG.strength;
+  const primaryBest    = chartData.length ? Math.max(...chartData.map((d) => d[cfg.primary] || 0)) : null;
+  const secondaryBest  = chartData.length ? Math.max(...chartData.map((d) => d[cfg.secondary] || 0)) : null;
+  const totalSessions  = chartData.length;
 
-  // Stats summary for the selected exercise
-  const bestE1rm    = chartData.length ? Math.max(...chartData.map((d) => d.e1rm || 0)) : null;
-  const bestVolume  = chartData.length ? Math.max(...chartData.map((d) => d.volume || 0)) : null;
-  const totalSessions = chartData.length;
+  // Duration display helper for stat box
+  const fmtStatPrimary = (v) => modality === 'duration' ? fmtSeconds(v) : v;
 
   return (
     <div style={S.shell}>
@@ -337,27 +623,37 @@ export default function App() {
         ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background:#2a2e38; border-radius:3px; }
       `}</style>
 
-      <input ref={fileRef} type="file" accept="image/*" onChange={onPhotoChosen} style={{ display: 'none' }} />
+      <input ref={fileRef}   type="file" accept="image/*"                   onChange={onPhotoChosen} style={{ display: 'none' }} />
       <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={onPhotoChosen} style={{ display: 'none' }} />
 
+      {/* ── HOME ── */}
       {screen === 'home' && (
         <div style={S.page}>
           <div style={S.kicker}>WORKOUT LOG</div>
           <h1 style={S.h1}>GYM&nbsp;TRACKER</h1>
           <div style={S.sub}>{workouts.length} session{workouts.length === 1 ? '' : 's'} · {names.length} exercise{names.length === 1 ? '' : 's'} tracked</div>
-
-          <button style={S.cta} onClick={() => setScreen('capture')}>+ NEW WORKOUT</button>
+          <button style={S.cta}   onClick={() => setScreen('capture')}>+ NEW WORKOUT</button>
           <button style={S.ghost} onClick={openProgress}>VIEW PROGRESS</button>
-
           <div style={S.label}>HISTORY</div>
           {workouts.length === 0 ? (
             <div style={S.empty}>No workouts yet. Tap "New Workout", snap the board, and log your sets.</div>
           ) : workouts.map((w) => (
             <div key={w.id} style={S.row} onClick={() => openWorkout(w.id)}>
               <div style={{ flex: 1 }}>
-                <div style={S.rowDate}>{new Date(w.date).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>
+                <div style={S.rowDate}>
+                  {new Date(w.date).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}
+                  {w.startTime && <span style={{ marginLeft: 8, opacity: 0.7 }}>{w.startTime}</span>}
+                  {w.workoutType && w.workoutType !== 'general' && (
+                    <span style={{ marginLeft: 8, fontSize: 10, background: 'rgba(215,255,50,0.12)', color: ACCENT, borderRadius: 4, padding: '1px 5px' }}>
+                      {WORKOUT_TYPE_LABELS[w.workoutType]?.split(' ')[1] || w.workoutType}
+                    </span>
+                  )}
+                </div>
                 <div style={S.rowName}>{w.className || `${w.exercises.length} exercise${w.exercises.length === 1 ? '' : 's'}`}</div>
-                <div style={S.rowMeta}>{w.exercises.slice(0, 3).map((e) => e.name).join(' · ')}{w.exercises.length > 3 ? ' …' : ''}</div>
+                <div style={S.rowMeta}>
+                  {w.exercises.slice(0, 3).map((e) => e.name).join(' · ')}{w.exercises.length > 3 ? ' …' : ''}
+                  {w.duration ? <span style={{ marginLeft: 8 }}>{w.duration}min</span> : ''}
+                </div>
               </div>
               <button style={S.del} onClick={(ev) => { ev.stopPropagation(); remove(w.id); }}>✕</button>
             </div>
@@ -365,19 +661,18 @@ export default function App() {
         </div>
       )}
 
+      {/* ── CAPTURE ── */}
       {screen === 'capture' && (
         <div style={S.page}>
           <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
           <h2 style={S.h2}>NEW WORKOUT</h2>
           <div style={S.sub}>Snap the board and let AI read the exercises — or enter them yourself.</div>
-
           {preview && <img src={preview} alt="board" style={S.previewImg} />}
-
           {busy ? (
             <div style={S.loading}><div style={S.spinner} /> Reading the board…</div>
           ) : (
             <>
-              <button style={S.cta} onClick={openUpload}>🖼 UPLOAD EXISTING PHOTO</button>
+              <button style={S.cta}   onClick={openUpload}>🖼 UPLOAD EXISTING PHOTO</button>
               <button style={S.ghost} onClick={openCamera}>📷 TAKE A PHOTO</button>
               <button style={S.ghost} onClick={startManual}>ENTER MANUALLY</button>
             </>
@@ -386,80 +681,122 @@ export default function App() {
         </div>
       )}
 
+      {/* ── EDIT ── */}
       {screen === 'edit' && draft && (
         <div style={S.page}>
           <button style={S.back} onClick={() => { setScreen('home'); setDraft(null); }}>‹ cancel</button>
           <h2 style={S.h2}>{draft.id ? 'EDIT WORKOUT' : 'LOG WORKOUT'}</h2>
-
           {preview && <img src={preview} alt="board" style={S.previewThumb} />}
 
-          <input
-            style={{ ...S.input, ...S.dateInput }}
-            type="date"
-            value={draft.date || ''}
-            onChange={(e) => setDraftField({ date: e.target.value })}
-          />
-          <input style={S.input} placeholder="Class / workout name (optional)" value={num(draft.className)} onChange={(e) => setDraftField({ className: e.target.value })} />
+          {/* Date + time row */}
+          <div style={S.rowInputs}>
+            <input style={{ ...S.input, ...S.dateInput, flex: 1, marginBottom: 0 }}
+              type="date" value={draft.date || ''} onChange={(e) => setDraftField({ date: e.target.value })} />
+            <input style={{ ...S.input, ...S.dateInput, width: 110, marginBottom: 0 }}
+              type="time" value={draft.startTime || ''} onChange={(e) => setDraftField({ startTime: e.target.value })}
+              placeholder="start" />
+          </div>
+
+          {/* Duration + class name row */}
+          <div style={{ ...S.rowInputs, marginTop: 10 }}>
+            <input style={{ ...S.input, width: 90, marginBottom: 0 }}
+              type="number" inputMode="numeric" placeholder="mins" value={num(draft.duration)}
+              onChange={(e) => setDraftField({ duration: parseNum(e.target.value) })} />
+            <input style={{ ...S.input, flex: 1, marginBottom: 0 }}
+              placeholder="Class / workout name (optional)" value={num(draft.className)}
+              onChange={(e) => setDraftField({ className: e.target.value })} />
+          </div>
+
+          {/* Workout type pills */}
+          <div style={{ ...S.chips, marginTop: 12, marginBottom: 16 }}>
+            {WORKOUT_TYPES.map((t) => (
+              <button key={t}
+                onClick={() => setDraftField({ workoutType: t })}
+                style={{ ...S.chip, ...(draft.workoutType === t ? S.chipOn : {}) }}>
+                {WORKOUT_TYPE_LABELS[t]}
+              </button>
+            ))}
+          </div>
 
           {draft.exercises.some((e) => e.guessed) && (
-            <div style={S.guessBanner}>⚡ Shorthand names were auto-suggested (e.g. "DB SA Row" → "Dumbbell Single Arm Row"). Tap a highlighted name to fix it, or ✓ to confirm. Once saved, each one is remembered — no re-asking next time.</div>
+            <div style={S.guessBanner}>⚡ Shorthand names were auto-suggested. Tap a highlighted name to fix it, or ✓ to confirm. Once saved, they're remembered.</div>
           )}
 
-          {draft.exercises.map((ex, i) => (
-            <div key={i} style={S.card}>
-              <div style={S.cardHead}>
-                <input style={{ ...S.exName, ...(ex.guessed ? S.exNameGuess : {}) }} placeholder="Exercise name" value={ex.name} onChange={(e) => updateExercise(i, { name: e.target.value, guessed: false, status: 'confirmed' })} />
-                {ex.guessed && <button style={S.confirmBtn} title="confirm name" onClick={() => updateExercise(i, { guessed: false, status: 'confirmed' })}>✓</button>}
-                <button style={S.del} onClick={() => removeExercise(i)}>✕</button>
-              </div>
-              {ex.guessed && ex.status === 'unknown' && <div style={S.guessTag}>⚠ couldn't auto-name "{ex.original}" — please check</div>}
-              {ex.guessed && ex.status !== 'unknown' && <div style={S.guessTag}>⚡ auto-suggested from "{ex.original}" — confirm ✓ or edit</div>}
-              {!ex.guessed && ex.status === 'remembered' && <div style={S.rememberTag}>✓ remembered "{ex.original}" from before</div>}
-              <div style={S.setHeader}><span style={{ width: 28 }}>#</span><span style={S.col}>reps</span><span style={S.col}>weight</span><span style={{ width: 56 }}>unit</span><span style={{ width: 28 }} /></div>
-              {ex.sets.map((s, si) => (
-                <div key={si} style={S.setRow}>
-                  <span style={S.setNo}>{si + 1}</span>
-                  <input style={S.setInput} type="number" inputMode="numeric" placeholder="–" value={num(s.reps)} onChange={(e) => updateSet(i, si, { reps: parseNum(e.target.value) })} />
-                  <input style={S.setInput} type="number" inputMode="decimal" placeholder="–" value={num(s.weight)} onChange={(e) => updateSet(i, si, { weight: parseNum(e.target.value) })} />
-                  <button style={S.unitBtn} onClick={() => updateSet(i, si, { weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit}</button>
-                  <button style={S.delSm} onClick={() => removeSet(i, si)}>✕</button>
+          {draft.exercises.map((ex, i) => {
+            const mod = ex.modality || 'strength';
+            const headers = SET_HEADERS[mod] || SET_HEADERS.strength;
+            return (
+              <div key={i} style={S.card}>
+                <div style={S.cardHead}>
+                  <input style={{ ...S.exName, ...(ex.guessed ? S.exNameGuess : {}) }}
+                    placeholder="Exercise name" value={ex.name}
+                    onChange={(e) => updateExercise(i, { name: e.target.value, guessed: false, status: 'confirmed' })} />
+                  {ex.guessed && <button style={S.confirmBtn} onClick={() => updateExercise(i, { guessed: false, status: 'confirmed' })}>✓</button>}
+                  <button style={S.del} onClick={() => removeExercise(i)}>✕</button>
                 </div>
-              ))}
-              <button style={S.addSet} onClick={() => addSet(i)}>+ add set</button>
-            </div>
-          ))}
+
+                {/* Modality badge — tap to cycle */}
+                <button style={{ ...S.modalityBadge, ...S.modalityColors[mod] }} onClick={() => cycleModality(i)}>
+                  {MODALITY_LABELS[mod]} ↻
+                </button>
+
+                {ex.guessed && ex.status === 'unknown'    && <div style={S.guessTag}>⚠ couldn't auto-name "{ex.original}" — please check</div>}
+                {ex.guessed && ex.status !== 'unknown'    && <div style={S.guessTag}>⚡ auto-suggested from "{ex.original}" — confirm ✓ or edit</div>}
+                {!ex.guessed && ex.status === 'remembered'&& <div style={S.rememberTag}>✓ remembered "{ex.original}" from before</div>}
+
+                {/* Set headers */}
+                <div style={S.setHeader}>
+                  {headers.map((h, hi) => (
+                    <span key={hi} style={hi === 0 ? { width: 28 } : hi === headers.length - 1 ? { width: 28 } : S.col}>{h}</span>
+                  ))}
+                </div>
+
+                {ex.sets.map((s, si) => (
+                  <div key={si} style={S.setRow}>
+                    <span style={S.setNo}>{si + 1}</span>
+                    {mod === 'strength'   && <SetRowStrength   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
+                    {mod === 'bodyweight' && <SetRowBodyweight s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
+                    {mod === 'distance'   && <SetRowDistance   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
+                    {mod === 'duration'   && <SetRowDuration   s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} />}
+                    {mod === 'cardio'     && <SetRowCardio     s={s} onUpdate={(p) => updateSet(i, si, p)} num={num} parseNum={parseNum} />}
+                    <button style={S.delSm} onClick={() => removeSet(i, si)}>✕</button>
+                  </div>
+                ))}
+                <button style={S.addSet} onClick={() => addSet(i)}>+ add set</button>
+              </div>
+            );
+          })}
 
           <button style={S.ghost} onClick={addExercise}>+ ADD EXERCISE</button>
-          <button style={S.cta} onClick={save}>SAVE WORKOUT</button>
+          <button style={S.cta}   onClick={save}>SAVE WORKOUT</button>
         </div>
       )}
 
+      {/* ── PROGRESS ── */}
       {screen === 'progress' && (
         <div style={S.page}>
           <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
           <h2 style={S.h2}>PROGRESS</h2>
-
           {names.length === 0 ? (
             <div style={S.empty}>Log a few workouts and your exercise trends will show up here.</div>
           ) : (
             <>
-              {/* Exercise selector chips */}
               <div style={S.chips}>
                 {names.map((n) => (
-                  <button key={n} onClick={() => pickChart(n)} style={{ ...S.chip, ...(n === chartName ? S.chipOn : {}) }}>{n}</button>
+                  <button key={n} onClick={() => pickChart(n)}
+                    style={{ ...S.chip, ...(n === chartName ? S.chipOn : {}) }}>{n}</button>
                 ))}
               </div>
 
-              {/* Stats summary row */}
               {chartData.length > 0 && (
                 <div style={S.statRow}>
                   <div style={S.statBox}>
-                    <div style={S.statVal}>{bestE1rm ?? '—'}<span style={S.statUnit}>kg</span></div>
-                    <div style={S.statLbl}>BEST e1RM</div>
+                    <div style={S.statVal}>{fmtStatPrimary(primaryBest) ?? '—'}<span style={S.statUnit}>{modality === 'duration' ? '' : modality === 'cardio' ? '' : modality === 'distance' ? 'm' : modality === 'bodyweight' ? '' : 'kg'}</span></div>
+                    <div style={S.statLbl}>{cfg.primaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
-                    <div style={S.statVal}>{bestVolume ?? '—'}<span style={S.statUnit}>kg</span></div>
-                    <div style={S.statLbl}>PEAK VOL.</div>
+                    <div style={S.statVal}>{secondaryBest ?? '—'}<span style={S.statUnit}>{modality === 'distance' || modality === 'cardio' ? 'm' : modality === 'bodyweight' ? '' : modality === 'duration' ? 's' : 'kg'}</span></div>
+                    <div style={S.statLbl}>{cfg.secondaryLabel.toUpperCase()}</div>
                   </div>
                   <div style={S.statBox}>
                     <div style={S.statVal}>{totalSessions}</div>
@@ -468,7 +805,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Chart view toggle */}
               <div style={S.toggle}>
                 <button style={{ ...S.toggleBtn, ...(chartView === 'combined' ? S.toggleOn : {}) }} onClick={() => setChartView('combined')}>COMBINED</button>
                 <button style={{ ...S.toggleBtn, ...(chartView === 'scatter'  ? S.toggleOn : {}) }} onClick={() => setChartView('scatter')}>SCATTER</button>
@@ -478,66 +814,60 @@ export default function App() {
                 <div style={S.empty}>Need at least two logged sessions of "{chartName}" to chart a trend.</div>
               ) : (
                 <>
-                  {/* ── COMBINED: e1RM line + Volume bars ── */}
                   {chartView === 'combined' && (
                     <>
                       <div style={S.chartCaption}>
-                        <span style={{ color: ACCENT }}>━</span> Estimated 1-rep max (e1RM) &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> Volume load (sets × reps × kg)
+                        <span style={{ color: ACCENT }}>━</span> {cfg.primaryLabel} &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> {cfg.secondaryLabel}
                       </div>
                       <div style={{ height: 260, marginTop: 6 }}>
                         <ResponsiveContainer width="100%" height="100%">
                           <ComposedChart data={chartData} margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
                             <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
                             <XAxis dataKey="label" tick={{ fill: '#8b909c', fontSize: 11 }} />
-                            {/* Left Y: e1RM */}
-                            <YAxis yAxisId="e1rm" orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={36} tickFormatter={(v) => `${v}`} />
-                            {/* Right Y: volume */}
-                            <YAxis yAxisId="vol"  orientation="right" tick={{ fill: '#6b9fff', fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
+                            <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} />
+                            <YAxis yAxisId="secondary" orientation="right" tick={{ fill: BLUE,      fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
                             <Tooltip content={<CombinedTooltip />} />
-                            <Bar  yAxisId="vol"  dataKey="volume"  fill={BLUE}  opacity={0.45} radius={[3,3,0,0]} name="Volume" />
-                            <Line yAxisId="e1rm" dataKey="e1rm"   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} name="e1RM" connectNulls />
+                            <Bar  yAxisId="secondary" dataKey={cfg.secondary} fill={BLUE}   opacity={0.45} radius={[3,3,0,0]} />
+                            <Line yAxisId="primary"   dataKey={cfg.primary}   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} connectNulls />
                           </ComposedChart>
                         </ResponsiveContainer>
                       </div>
-                      <div style={S.chartNote}>
-                        e1RM normalises any set to a "if you went all-out" number — so a heavy 1×3 and a lighter 4×12 are comparable.
-                      </div>
+                      <div style={S.chartNote}>{cfg.note}</div>
                     </>
                   )}
 
-                  {/* ── SCATTER: each set as a dot. Y = weight, bubble size = reps ── */}
                   {chartView === 'scatter' && (
                     <>
                       <div style={S.chartCaption}>
-                        Each dot = one set. Y-axis = weight lifted. Dot size = rep count.
+                        {modality === 'cardio'
+                          ? 'Each dot = one set. Y = distance. Dot size = resistance level.'
+                          : modality === 'strength'
+                          ? 'Each dot = one set. Y = weight. Dot size = rep count.'
+                          : 'Each dot = one set. Y = primary metric over time.'}
                       </div>
                       <div style={{ height: 260, marginTop: 6 }}>
                         <ResponsiveContainer width="100%" height="100%">
                           <ScatterChart margin={{ top: 4, right: 10, left: 0, bottom: 0 }}>
                             <CartesianGrid stroke="#1d2027" strokeDasharray="3 3" />
-                            <XAxis
-                              dataKey="label"
-                              type="category"
-                              allowDuplicatedCategory={false}
-                              tick={{ fill: '#8b909c', fontSize: 11 }}
-                              name="Date"
-                            />
-                            <YAxis dataKey="weight" tick={{ fill: '#8b909c', fontSize: 11 }} width={36} name="Weight" unit="kg" />
-                            {/* ZAxis maps rep count → visual dot radius (px²) */}
-                            <ZAxis dataKey="z" range={[40, 260]} name="Reps" />
+                            <XAxis dataKey="label" type="category" allowDuplicatedCategory={false} tick={{ fill: '#8b909c', fontSize: 11 }} name="Date" />
+                            <YAxis dataKey="weight" tick={{ fill: '#8b909c', fontSize: 11 }} width={38} name="Value" />
+                            <ZAxis dataKey="z" range={[40, 300]} name="Size" />
                             <Tooltip content={<ScatterTooltip />} />
                             <Scatter data={scatterPoints} fill={ACCENT} fillOpacity={0.75} />
                           </ScatterChart>
                         </ResponsiveContainer>
                       </div>
                       <div style={S.chartNote}>
-                        Bigger dots = more reps. Heavy low-rep sets appear as small high dots; volume sets appear as large lower dots.
+                        {modality === 'strength'   && 'Bigger dots = more reps. High small dot = heavy low-rep set. Low big dot = high-volume set.'}
+                        {modality === 'bodyweight' && 'Each dot is one set. Y = rep count.'}
+                        {modality === 'distance'   && 'Each dot is one set. Y = distance covered.'}
+                        {modality === 'duration'   && 'Each dot is one set. Y = hold duration in seconds.'}
+                        {modality === 'cardio'     && 'Each dot is one set. Y = distance. Bigger dot = higher resistance.'}
                       </div>
                     </>
                   )}
                 </>
               )}
-
               <div style={S.note}>Next up (v1.1): personal records and streaks.</div>
             </>
           )}
@@ -547,6 +877,9 @@ export default function App() {
   );
 }
 
+/* ===========================================================================
+   STYLES
+=========================================================================== */
 const S = {
   shell:      { background: '#0c0d10', color: '#e7e9ee', minHeight: '100vh', fontFamily: "'IBM Plex Mono', ui-monospace, monospace" },
   page:       { maxWidth: 540, margin: '0 auto', padding: '26px 18px 70px', animation: 'rise .25s ease' },
@@ -570,38 +903,49 @@ const S = {
   errBox:     { marginTop: 12, padding: 12, background: '#1a1115', border: '1px solid #5a2330', borderRadius: 10, color: '#ff9aa6', fontSize: 12.5, lineHeight: 1.5 },
   inlineBtn:  { background: 'none', border: 'none', color: ACCENT, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12.5, padding: 0 },
   input:      { width: '100%', padding: '12px 14px', background: '#13151b', border: '1px solid #20232b', borderRadius: 10, color: '#e7e9ee', fontSize: 14, marginBottom: 14 },
-  dateInput:  { colorScheme: 'dark', marginBottom: 10 },
+  dateInput:  { colorScheme: 'dark' },
+  rowInputs:  { display: 'flex', gap: 10, alignItems: 'stretch' },
   card:       { background: '#11131a', border: '1px solid #1d2027', borderRadius: 12, padding: 14, marginBottom: 12 },
-  cardHead:   { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 },
+  cardHead:   { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 },
   exName:     { flex: 1, padding: '10px 12px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontFamily: "'Oswald', sans-serif", fontWeight: 500, fontSize: 16 },
   exNameGuess:{ borderColor: ACCENT, boxShadow: '0 0 0 1px ' + ACCENT },
   confirmBtn: { width: 40, padding: '8px 0', background: ACCENT, color: '#0c0d10', border: 'none', borderRadius: 8, fontSize: 16, fontWeight: 700, cursor: 'pointer' },
+  // Modality badge
+  modalityBadge: { display: 'inline-block', fontSize: 11, padding: '4px 10px', borderRadius: 20, border: '1px solid', cursor: 'pointer', marginBottom: 10, fontFamily: 'inherit', letterSpacing: 0.5 },
+  modalityColors: {
+    strength:   { background: 'rgba(215,255,50,0.08)',  color: ACCENT,    borderColor: 'rgba(215,255,50,0.3)' },
+    bodyweight: { background: 'rgba(107,159,255,0.08)', color: BLUE,      borderColor: 'rgba(107,159,255,0.3)' },
+    distance:   { background: 'rgba(255,178,71,0.08)',  color: '#ffb247', borderColor: 'rgba(255,178,71,0.3)' },
+    duration:   { background: 'rgba(160,107,255,0.08)', color: '#a06bff', borderColor: 'rgba(160,107,255,0.3)' },
+    cardio:     { background: 'rgba(71,225,178,0.08)',  color: '#47e1b2', borderColor: 'rgba(71,225,178,0.3)' },
+  },
   setHeader:  { display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, letterSpacing: 1, color: '#6b7080', marginBottom: 6, paddingLeft: 2 },
   col:        { flex: 1 },
   setRow:     { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 7 },
   setNo:      { width: 28, fontSize: 12, color: '#7b8090', textAlign: 'center' },
-  setInput:   { flex: 1, width: '100%', padding: '10px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontSize: 15, textAlign: 'center' },
-  unitBtn:    { width: 56, padding: '10px 0', background: '#1a1d24', border: '1px solid #2a2e38', borderRadius: 8, color: ACCENT, fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  setInput:   { flex: 1, padding: '10px', background: '#0c0d10', border: '1px solid #20232b', borderRadius: 8, color: '#e7e9ee', fontSize: 14, textAlign: 'center' },
+  unitBtn:    { width: 48, padding: '10px 0', background: '#1a1d24', border: '1px solid #2a2e38', borderRadius: 8, color: ACCENT, fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  // Resistance stepper
+  stepper:    { display: 'flex', alignItems: 'center', background: '#1a1d24', border: '1px solid #2a2e38', borderRadius: 8, overflow: 'hidden' },
+  stepBtn:    { width: 28, padding: '10px 0', background: 'transparent', border: 'none', color: '#8b909c', fontSize: 15, cursor: 'pointer', fontFamily: 'inherit' },
+  stepVal:    { width: 22, textAlign: 'center', fontSize: 13, color: '#47e1b2' },
   del:        { background: 'none', border: 'none', color: '#6b7080', fontSize: 16, cursor: 'pointer', padding: '4px 8px' },
   delSm:      { width: 28, background: 'none', border: 'none', color: '#5a5f6b', fontSize: 13, cursor: 'pointer' },
   addSet:     { background: 'none', border: '1px dashed #2a2e38', borderRadius: 8, color: '#8b909c', fontFamily: 'inherit', fontSize: 12, padding: '8px', width: '100%', cursor: 'pointer', marginTop: 4 },
   guessBanner:{ background: 'rgba(215,255,50,0.08)', border: '1px solid rgba(215,255,50,0.35)', borderRadius: 10, padding: '11px 13px', fontSize: 12, color: '#d7ff32', lineHeight: 1.55, marginBottom: 14 },
-  guessTag:   { fontSize: 11, color: '#aeb86b', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
-  rememberTag:{ fontSize: 11, color: '#6b7080', margin: '-4px 0 10px 2px', lineHeight: 1.4 },
+  guessTag:   { fontSize: 11, color: '#aeb86b', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
+  rememberTag:{ fontSize: 11, color: '#6b7080', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
   chips:      { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
-  chip:       { padding: '8px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
+  chip:       { padding: '7px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
   chipOn:     { background: ACCENT, color: '#0c0d10', borderColor: ACCENT, fontWeight: 500 },
-  // Stats summary
   statRow:    { display: 'flex', gap: 8, marginBottom: 16 },
   statBox:    { flex: 1, background: '#11131a', border: '1px solid #1d2027', borderRadius: 10, padding: '10px 8px', textAlign: 'center' },
-  statVal:    { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 22, color: '#e7e9ee', lineHeight: 1 },
+  statVal:    { fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 20, color: '#e7e9ee', lineHeight: 1 },
   statUnit:   { fontSize: 11, color: '#8b909c', marginLeft: 2 },
   statLbl:    { fontSize: 9, letterSpacing: 1.5, color: '#6b7080', marginTop: 4 },
-  // Chart toggle
   toggle:     { display: 'flex', background: '#11131a', border: '1px solid #1d2027', borderRadius: 10, overflow: 'hidden', marginBottom: 14 },
   toggleBtn:  { flex: 1, padding: '10px', background: 'transparent', border: 'none', color: '#6b7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: 1.5, cursor: 'pointer' },
   toggleOn:   { background: '#1d2027', color: ACCENT },
-  // Chart annotations
   chartCaption: { fontSize: 11, color: '#6b7080', marginBottom: 2, lineHeight: 1.5 },
   chartNote:  { fontSize: 11, color: '#6b7080', marginTop: 10, lineHeight: 1.6, padding: '8px 10px', background: '#11131a', borderRadius: 8, border: '1px solid #1d2027' },
   chartLabel: { fontSize: 12, color: '#8b909c', letterSpacing: 1 },
