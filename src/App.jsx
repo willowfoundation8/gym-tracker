@@ -148,14 +148,24 @@ async function fileToImage(file, maxDim = 1024) {
 
 async function extractExercises(base64) {
   const prompt =
-    'You are reading a gym workout board from a photo. Extract the list of exercises. ' +
-    'For each "name", use the EXACT text as written on the board (do not expand abbreviations). ' +
-    'Also suggest the exercise modality based on the name: ' +
-    '"strength" (weighted reps), "bodyweight" (reps, no load), ' +
-    '"distance" (sled, carry, run), "duration" (plank, holds), "cardio" (rower, ski erg, bike). ' +
-    'Respond with ONLY a JSON array, no prose, no markdown fences. Each item: ' +
-    '{"name": string, "suggestedSets": number|null, "suggestedReps": number|null, "modality": string}. ' +
-    "If sets/reps aren't shown use null. Default modality to \"strength\" if unsure. Preserve board order.";
+    'You are reading a gym workout board from a photo. Extract the list of exercises.\n\n' +
+    'CRITICAL RULE — separate the PRESCRIPTION (how much to do) from the NAME (the movement itself):\n' +
+    '- "name" must contain ONLY the canonical movement. NEVER put rep counts, set counts, distances, durations, or box heights in the name.\n' +
+    '- Movement QUALIFIERS are part of the name and MUST be kept: "Single Arm", "Single Leg", "Double Under", "1-Arm", "Bulgarian", etc. They describe HOW the movement is done, not how much.\n' +
+    '- You MAY keep shorthand/abbreviations in the name (e.g. "DB", "BB", "Medball") — those are expanded in a later step. Only strip the prescription numbers.\n' +
+    '- Route every prescription number into its OWN field based on what it measures.\n\n' +
+    'Examples:\n' +
+    '- "28x Medball Step Over" -> {"name":"Medball Step Over","suggestedReps":28,"modality":"bodyweight"}\n' +
+    '- "Single Arm DB Row" -> {"name":"Single Arm DB Row","modality":"strength"} (no numbers; "Single" stays)\n' +
+    '- "Box Jump 24\"" -> {"name":"Box Jump","suggestedHeight":24,"suggestedHeightUnit":"in","modality":"bodyweight"}\n' +
+    '- "5km Run" -> {"name":"Run","suggestedDistance":5,"suggestedDistUnit":"km","modality":"distance"}\n' +
+    '- "500m Row" -> {"name":"Row","suggestedDistance":500,"suggestedDistUnit":"m","modality":"cardio"}\n' +
+    '- "30s Plank" -> {"name":"Plank","suggestedSeconds":30,"modality":"duration"}\n' +
+    '- "3x10 Squat" -> {"name":"Squat","suggestedSets":3,"suggestedReps":10,"modality":"strength"}\n\n' +
+    'Modality: "strength" (weighted reps), "bodyweight" (reps, no load), "distance" (sled, carry, run), "duration" (plank, holds), "cardio" (rower, ski erg, bike). Default "strength" if unsure.\n\n' +
+    'Respond with ONLY a JSON array, no prose, no markdown fences. Each item:\n' +
+    '{"name":string,"suggestedSets":number|null,"suggestedReps":number|null,"suggestedDistance":number|null,"suggestedDistUnit":"m"|"km"|null,"suggestedSeconds":number|null,"suggestedHeight":number|null,"suggestedHeightUnit":"in"|"cm"|null,"modality":string}\n' +
+    'Use null for anything not shown. Preserve board order.';
   const res = await fetch('/api/vision', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -170,17 +180,31 @@ async function extractExercises(base64) {
   const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
   const arr = JSON.parse(clean);
   return arr.map((x) => ({
-    raw:          (x.name || 'Exercise').trim(),
-    suggestedSets: x.suggestedSets ?? null,
-    suggestedReps: x.suggestedReps ?? null,
-    aiModality:   MODALITIES.includes(x.modality) ? x.modality : 'strength',
+    raw:                 stripPrescription((x.name || 'Exercise').trim()),
+    suggestedSets:       x.suggestedSets ?? null,
+    suggestedReps:       x.suggestedReps ?? null,
+    suggestedDistance:   x.suggestedDistance ?? null,
+    suggestedDistUnit:   (x.suggestedDistUnit === 'km' || x.suggestedDistUnit === 'm') ? x.suggestedDistUnit : null,
+    suggestedSeconds:    x.suggestedSeconds ?? null,
+    suggestedHeight:     x.suggestedHeight ?? null,
+    suggestedHeightUnit: (x.suggestedHeightUnit === 'cm' || x.suggestedHeightUnit === 'in') ? x.suggestedHeightUnit : null,
+    aiModality:          MODALITIES.includes(x.modality) ? x.modality : 'strength',
   }));
+}
+
+// Safety net: strip a LEADING count token (e.g. "28x", "14 × ", "3x") that the
+// model may have left in the name. Narrow by design — only matches <number>
+// followed by x/×, so it never touches qualifiers ("Single Arm"), bare numbers
+// in a name ("180 Jump"), distances ("5km Run" has no x), or trailing heights.
+function stripPrescription(name) {
+  return name.replace(/^\s*\d+\s*[x×]\s*/i, '').trim() || name;
 }
 
 async function expandViaAI(rawList) {
   const prompt =
     'These are exercise names written in shorthand on a gym workout board. ' +
     'Expand each to its full, standard exercise name (e.g. "DB SA Row" -> "Dumbbell Single Arm Row", "BB OHP" -> "Barbell Overhead Press"). ' +
+    'IMPORTANT: strip any leftover prescription from the name — leading rep/set counts ("28x", "3x"), distances ("5km"), or durations ("30s"). Return ONLY the clean movement name. KEEP qualifiers like "Single Arm", "Single Leg", "Double Under". ' +
     'Keep names concise and standard. Respond with ONLY a JSON object mapping each EXACT input string to its expanded name - no prose, no markdown fences.\n\nInputs: ' +
     JSON.stringify(rawList);
   const res = await fetch('/api/expand', {
@@ -380,11 +404,23 @@ function SetRowStrength({ s, si, onUpdate, onRemove, num, parseNum }) {
 }
 
 function SetRowBodyweight({ s, onUpdate, onRemove, num, parseNum }) {
+  // When the board specified a box-jump-style height, the set carries a `height`
+  // key. Show a height field (+ in/cm toggle) in place of the optional weight.
+  const hasHeight = Object.prototype.hasOwnProperty.call(s, 'height');
   return (
     <>
       <input style={{ ...S.setInput, flex: 2 }} type="number" inputMode="numeric" placeholder="reps" value={num(s.reps)} onChange={(e) => onUpdate({ reps: parseNum(e.target.value) })} />
-      <input style={S.setInput} type="number" inputMode="decimal" placeholder="+wt" value={num(s.weight)} onChange={(e) => onUpdate({ weight: parseNum(e.target.value) })} />
-      <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
+      {hasHeight ? (
+        <>
+          <input style={S.setInput} type="number" inputMode="decimal" placeholder="ht" value={num(s.height)} onChange={(e) => onUpdate({ height: parseNum(e.target.value) })} />
+          <button style={S.unitBtn} onClick={() => onUpdate({ heightUnit: s.heightUnit === 'in' ? 'cm' : 'in' })}>{s.heightUnit || 'in'}</button>
+        </>
+      ) : (
+        <>
+          <input style={S.setInput} type="number" inputMode="decimal" placeholder="+wt" value={num(s.weight)} onChange={(e) => onUpdate({ weight: parseNum(e.target.value) })} />
+          <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
+        </>
+      )}
     </>
   );
 }
@@ -512,8 +548,25 @@ export default function App() {
         const count = read[i].suggestedSets ?? 1;
         const sets = Array.from({ length: Math.max(1, count) }, () => {
           const s = emptySet(modality);
-          if (modality === 'strength' || modality === 'bodyweight') {
-            s.reps = read[i].suggestedReps ?? null;
+          const r0 = read[i];
+          if (modality === 'strength') {
+            s.reps = r0.suggestedReps ?? null;
+          } else if (modality === 'bodyweight') {
+            s.reps = r0.suggestedReps ?? null;
+            // Box-jump-style height: only attach the key when the board specified one
+            if (r0.suggestedHeight != null) {
+              s.height = r0.suggestedHeight;
+              s.heightUnit = r0.suggestedHeightUnit || 'in';
+            }
+          } else if (modality === 'distance') {
+            s.distance = r0.suggestedDistance ?? null;
+            s.distUnit = r0.suggestedDistUnit || 'm';
+          } else if (modality === 'duration') {
+            s.seconds = r0.suggestedSeconds ?? null;
+          } else if (modality === 'cardio') {
+            s.distance = r0.suggestedDistance ?? null;
+            s.distUnit = r0.suggestedDistUnit || 'm';
+            s.seconds = r0.suggestedSeconds ?? null;
           }
           return s;
         });
@@ -768,7 +821,11 @@ export default function App() {
           <div className="gt-exercise-grid">
           {draft.exercises.map((ex, i) => {
             const mod = ex.modality || 'strength';
-            const headers = SET_HEADERS[mod] || SET_HEADERS.strength;
+            let headers = SET_HEADERS[mod] || SET_HEADERS.strength;
+            // Bodyweight with a board-specified height shows ht instead of +wt
+            if (mod === 'bodyweight' && ex.sets.some((s) => Object.prototype.hasOwnProperty.call(s, 'height'))) {
+              headers = ['#', 'reps', 'ht', 'unit', ''];
+            }
             return (
               <div key={i} style={S.card}>
                 <div style={S.cardHead}>
@@ -997,4 +1054,3 @@ const S = {
   chartLabel: { fontSize: 12, color: '#8b909c', letterSpacing: 1 },
   note:       { fontSize: 11, color: '#6b7080', marginTop: 16, textAlign: 'center' },
 };
-
