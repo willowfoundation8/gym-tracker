@@ -9,7 +9,7 @@ export async function onRequestGet({ env }) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6, max_tokens: 50, messages: [{ role: 'user', content: 'Say hi' }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 50, messages: [{ role: 'user', content: 'Say hi' }] }),
     });
     const body = await r.text();
     return new Response(JSON.stringify({ keyLoaded: true, anthropicStatus: r.status, anthropicBody: body }, null, 2), { headers: { 'content-type': 'application/json' } });
