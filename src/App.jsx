@@ -12,9 +12,44 @@ import {
   getExerciseNames, getAbbrevMap, learnAbbrev, nameKey,
   getModalityMap, learnModality,
   exportAll, importAll, exportCSV,
+  logEvent, getLogs, clearLogs,
 } from './db';
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+
+// Parse model output that SHOULD be bare JSON but may carry fences, a prose
+// preamble, or trailing text. Last resort: slice first '['/'{' to last ']'/'}'.
+// Returns null if nothing parseable (e.g. truncated output).
+function parseModelJSON(text) {
+  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+  try { return JSON.parse(clean); } catch { /* fall through */ }
+  const ai = clean.indexOf('['), oi = clean.indexOf('{');
+  const arrayRooted = ai > -1 && (oi === -1 || ai < oi);
+  if (arrayRooted) {
+    // Prose around an intact array
+    const b = clean.lastIndexOf(']');
+    if (b > ai) { try { return JSON.parse(clean.slice(ai, b + 1)); } catch { /* next */ } }
+    // Truncated array (e.g. max_tokens cutoff): keep every complete element,
+    // drop the cut one, close the bracket. Partial read beats total failure.
+    const lastObj = clean.lastIndexOf('}');
+    if (lastObj > ai) { try { return JSON.parse(clean.slice(ai, lastObj + 1) + ']'); } catch { /* next */ } }
+  } else if (oi > -1) {
+    const b = clean.lastIndexOf('}');
+    if (b > oi) { try { return JSON.parse(clean.slice(oi, b + 1)); } catch { /* next */ } }
+  }
+  return null;
+}
+
+// One automatic retry with a short pause — covers transient 429/529 and the
+// occasional malformed sample without user intervention.
+async function withRetry(fn, label) {
+  try { return await fn(); }
+  catch (e) {
+    logEvent('warn', label + '_retrying', e.message);
+    await new Promise((r) => setTimeout(r, 800));
+    return fn();
+  }
+}
 
 /* ===========================================================================
    MODALITY — seed dictionary + helpers
@@ -174,6 +209,7 @@ async function fileToImage(file, maxDim = 1024) {
 }
 
 async function extractExercises(base64) {
+  const t0 = Date.now();
   const prompt =
     'You are reading a gym workout board from a photo. Extract the list of exercises.\n\n' +
     'CRITICAL RULE — separate the PRESCRIPTION (how much to do) from the NAME (the movement itself):\n' +
@@ -210,11 +246,24 @@ async function extractExercises(base64) {
       { type: 'text', text: prompt },
     ] }] }),
   });
-  if (!res.ok) throw new Error('Vision request failed: ' + res.status);
+  if (!res.ok) {
+    logEvent('error', 'vision_http', `status ${res.status}`);
+    throw new Error('vision_http_' + res.status);
+  }
   const data = await res.json();
+  const stop = data.stop_reason || '?';
   const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  const arr = JSON.parse(clean);
+  const arr = parseModelJSON(text);
+  if (!Array.isArray(arr)) {
+    // stop_reason 'max_tokens' = response was cut off by the Worker's limit
+    logEvent('error', 'vision_parse', `stop=${stop} len=${text.length} head=${text.slice(0, 200)}`);
+    throw new Error(stop === 'max_tokens' ? 'vision_truncated' : 'vision_parse');
+  }
+  if (stop === 'max_tokens') {
+    logEvent('warn', 'vision_salvaged', `truncated by max_tokens — recovered ${arr.length} exercises, the last one on the board may be missing. Raise max_tokens in vision.js.`);
+  } else {
+    logEvent('info', 'vision_ok', `${arr.length} exercises · ${Date.now() - t0}ms · len=${text.length} · stop=${stop}`);
+  }
   return arr.map((x) => ({
     raw:                 stripPrescription((x.name || 'Exercise').trim()),
     suggestedSets:       x.suggestedSets ?? null,
@@ -253,11 +302,18 @@ async function expandViaAI(rawList) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ messages: [{ role: 'user', content: prompt }] }),
   });
-  if (!res.ok) throw new Error('Expand request failed: ' + res.status);
+  if (!res.ok) {
+    logEvent('warn', 'expand_http', `status ${res.status}`);
+    throw new Error('Expand request failed: ' + res.status);
+  }
   const data = await res.json();
   const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  return JSON.parse(clean);
+  const obj = parseModelJSON(text);
+  if (!obj || typeof obj !== 'object') {
+    logEvent('warn', 'expand_parse', `len=${text.length} head=${text.slice(0, 120)}`);
+    throw new Error('expand_parse');
+  }
+  return obj;
 }
 
 async function resolveNames(rawList) {
@@ -268,7 +324,7 @@ async function resolveNames(rawList) {
     try {
       const suggestions = await expandViaAI([...new Set(unknown)]);
       Object.entries(suggestions || {}).forEach(([k, v]) => { sugByKey[nameKey(k)] = v; });
-    } catch { sugByKey = {}; }
+    } catch (e) { logEvent('warn', 'expand_fallback', e.message + ' — names kept raw'); sugByKey = {}; }
   }
   return rawList.map((raw) => {
     const key = nameKey(raw);
@@ -617,6 +673,7 @@ export default function App() {
   const [chartView, setChartView] = useState('combined');
   const [confirmId, setConfirmId] = useState(null);   // two-tap delete guard
   const [dataMsg, setDataMsg]     = useState(null);    // export/import feedback
+  const [logs, setLogs]           = useState([]);
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
   const importRef = useRef(null);
@@ -639,7 +696,7 @@ export default function App() {
     try {
       const { preview, base64 } = await fileToImage(file);
       setPreview(preview);
-      const read = await extractExercises(base64);
+      const read = await withRetry(() => extractExercises(base64), 'vision');
       const resolved = await resolveNames(read.map((r) => r.raw));
       // Load learned modality map once for all exercises
       const modalityMap = await getModalityMap();
@@ -694,7 +751,15 @@ export default function App() {
       setDraft({ className: null, date: todayStr(), startTime: null, duration: null, workoutType: 'general', exercises });
       setScreen('edit');
     } catch (err) {
-      setVisionErr("Couldn't read the board automatically — you can enter it by hand.");
+      logEvent('error', 'board_read_failed', err.message);
+      const m = err.message || '';
+      setVisionErr(
+        m === 'vision_truncated'
+          ? 'The board read was cut off — too many items for the current API limit. Raise max_tokens in vision.js (try 4000), or trim the photo.'
+          : m.startsWith('vision_http_42') || m.startsWith('vision_http_52')
+          ? 'The AI service is busy right now — give it a few seconds and try again.'
+          : "Couldn't read the board automatically — you can enter it by hand."
+      );
     } finally {
       setBusy(false);
       if (fileRef.current) fileRef.current.value = '';
@@ -787,6 +852,9 @@ export default function App() {
     setScreen('progress');
   }
   function pickChart(n) { setChartName(n); setChartData(computeProgressData(workouts, n)); }
+
+  async function openLogs() { setLogs(await getLogs(50)); setScreen('logs'); }
+  async function onClearLogs() { await clearLogs(); setLogs([]); }
 
   // ── Data export / import (Phase 2) ──
   function downloadFile(filename, content, mime) {
@@ -946,6 +1014,7 @@ export default function App() {
             <button style={S.dataBtn} onClick={onExportJSON}>⬇ Backup</button>
             <button style={S.dataBtn} onClick={onExportCSV}>⬇ CSV</button>
             <button style={S.dataBtn} onClick={() => importRef.current?.click()}>⬆ Restore</button>
+            <button style={S.dataBtn} onClick={openLogs}>🪵 Logs</button>
           </div>
           {dataMsg && <div style={S.dataMsg}>{dataMsg}</div>}
           <div style={S.dataNote}>Your data lives in this browser only. Back it up occasionally — clearing browser data wipes it.</div>
@@ -1180,6 +1249,32 @@ export default function App() {
           )}
         </div>
       )}
+
+      {/* ── LOGS ── */}
+      {screen === 'logs' && (
+        <div style={S.page} className="gt-page">
+          <button style={S.back} onClick={() => setScreen('home')}>‹ back</button>
+          <h2 style={S.h2} className="gt-h2">DIAGNOSTICS</h2>
+          <div style={S.sub} className="gt-sub">Last {logs.length} events, newest first. Board-read failures land here with the reason.</div>
+          {logs.length === 0 ? (
+            <div style={S.empty}>No events logged yet.</div>
+          ) : (
+            <>
+              {logs.map((l) => (
+                <div key={l.id} style={S.logRow}>
+                  <div style={S.logHead}>
+                    <span style={{ ...S.logLevel, color: l.level === 'error' ? '#ff5a6e' : l.level === 'warn' ? '#ffb247' : '#7fbfa0' }}>{l.level}</span>
+                    <span style={S.logEvent}>{l.event}</span>
+                    <span style={S.logTs}>{new Date(l.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
+                  {l.detail && <div style={S.logDetail}>{l.detail}</div>}
+                </div>
+              ))}
+              <button style={{ ...S.dataBtn, marginTop: 12 }} onClick={onClearLogs}>Clear log</button>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1262,4 +1357,10 @@ const S = {
   dataBtn:    { flex: 1, padding: '10px 0', background: 'transparent', border: '1px solid #2a2e38', borderRadius: 8, color: '#8b909c', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
   dataMsg:    { fontSize: 11.5, color: '#7fbfa0', marginTop: 10, lineHeight: 1.5 },
   dataNote:   { fontSize: 10.5, color: '#5a5f6b', marginTop: 10, lineHeight: 1.6 },
+  logRow:     { background: '#11131a', border: '1px solid #1d2027', borderRadius: 8, padding: '9px 11px', marginBottom: 7 },
+  logHead:    { display: 'flex', alignItems: 'baseline', gap: 8 },
+  logLevel:   { fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', flexShrink: 0 },
+  logEvent:   { fontSize: 12, color: '#e7e9ee', flex: 1, minWidth: 0 },
+  logTs:      { fontSize: 10, color: '#5a5f6b', flexShrink: 0 },
+  logDetail:  { fontSize: 10.5, color: '#8b909c', marginTop: 4, lineHeight: 1.5, wordBreak: 'break-word' },
 };
