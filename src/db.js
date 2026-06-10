@@ -18,6 +18,14 @@ db.version(2).stores({
   modalities: 'key',   // learned exercise modality: { key, modality }
 });
 
+// Version 3: adds logs table for on-device diagnostics.
+db.version(3).stores({
+  workouts:   'id, date',
+  abbrevs:    'key',
+  modalities: 'key',
+  logs:       'id, ts',  // { id, ts, level, event, detail }
+});
+
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 const now  = () => new Date().toISOString();
 export const nameKey = (n) => (n || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -176,4 +184,25 @@ export function workoutsToCSV(workouts) {
 export async function exportCSV() {
   const ws = (await db.workouts.toArray()).sort((a, b) => new Date(a.date) - new Date(b.date));
   return workoutsToCSV(ws);
+}
+
+/* ===========================================================================
+   DIAGNOSTIC LOG — on-device, capped at 200 entries, never throws.
+=========================================================================== */
+const LOG_CAP = 200;
+export async function logEvent(level, event, detail) {
+  try {
+    await db.logs.add({ id: uuid(), ts: now(), level, event, detail: detail ? String(detail).slice(0, 500) : null });
+    const count = await db.logs.count();
+    if (count > LOG_CAP) {
+      const overflow = await db.logs.orderBy('ts').limit(count - LOG_CAP).toArray();
+      await db.logs.bulkDelete(overflow.map((r) => r.id));
+    }
+  } catch { /* logging must never break the app */ }
+}
+export async function getLogs(limit = 50) {
+  return db.logs.orderBy('ts').reverse().limit(limit).toArray();
+}
+export async function clearLogs() {
+  await db.logs.clear();
 }
