@@ -181,6 +181,11 @@ async function extractExercises(base64) {
     '- Movement QUALIFIERS are part of the name and MUST be kept: "Single Arm", "Single Leg", "Double Under", "1-Arm", "Bulgarian", etc. They describe HOW the movement is done, not how much.\n' +
     '- You MAY keep shorthand/abbreviations in the name (e.g. "DB", "BB", "Medball") — those are expanded in a later step. Only strip the prescription numbers.\n' +
     '- Route every prescription number into its OWN field based on what it measures.\n\n' +
+    'BLOCK PRESCRIPTIONS — set/round counts often appear as a HEADER above a group of exercises:\n' +
+    '- A header like "3 Sets", "5 Sets", "4 Rounds", or "2 Rounds (14 each)" applies to EVERY exercise listed below it, until the next header or section. Set suggestedSets on each of those exercises.\n' +
+    '- "Rounds" means the same as sets. "(14 each)" means suggestedReps 14 for every exercise in that block.\n' +
+    '- For a rep RANGE like "12-15", use the LOWER bound (suggestedReps: 12).\n' +
+    '- A per-set rep scheme like "5-5-4-4-3" means 5 sets with DIFFERENT reps each: use suggestedRepsPerSet [5,5,4,4,3] instead of suggestedSets/suggestedReps.\n\n' +
     'Examples:\n' +
     '- "28x Medball Step Over" -> {"name":"Medball Step Over","suggestedReps":28,"modality":"bodyweight"}\n' +
     '- "Single Arm DB Row" -> {"name":"Single Arm DB Row","modality":"strength"} (no numbers; "Single" stays)\n' +
@@ -189,11 +194,13 @@ async function extractExercises(base64) {
     '- "500m Row" -> {"name":"Row","suggestedDistance":500,"suggestedDistUnit":"m","modality":"cardio"}\n' +
     '- "30s Plank" -> {"name":"Plank","suggestedSeconds":30,"modality":"duration"}\n' +
     '- "3x10 Squat" -> {"name":"Squat","suggestedSets":3,"suggestedReps":10,"modality":"strength"}\n' +
+    '- Board section "3 Sets" followed by "DB Sumo Squat 12-15", "Add Clamps x 12-15 ES", "DB Calf Raises x 15-20" -> THREE items, each inheriting the header: [{"name":"DB Sumo Squat","suggestedSets":3,"suggestedReps":12,"modality":"strength"},{"name":"Add Clamps","suggestedSets":3,"suggestedReps":12,"modality":"bodyweight"},{"name":"DB Calf Raises","suggestedSets":3,"suggestedReps":15,"modality":"strength"}]\n' +
+    '- "5 Sets" followed by "BB Back Squat 5-5-4-4-3" -> {"name":"BB Back Squat","suggestedRepsPerSet":[5,5,4,4,3],"modality":"strength"}\n' +
     '- "Sled Push 100kg x 20m" -> {"name":"Sled Push","suggestedWeight":100,"suggestedWeightUnit":"kg","suggestedDistance":20,"suggestedDistUnit":"m","modality":"loaded_distance"}\n' +
     '- "Farmers Carry 24kg / 40m" -> {"name":"Farmers Carry","suggestedWeight":24,"suggestedWeightUnit":"kg","suggestedDistance":40,"suggestedDistUnit":"m","modality":"loaded_distance"}\n\n' +
     'Modality: "strength" (weighted reps), "bodyweight" (reps, no load), "distance" (unloaded run/sprint), "loaded_distance" (sled push/pull, prowler, farmers/waiters/suitcase carry, weighted walks — weight AND distance), "duration" (plank, holds), "cardio" (rower, ski erg, bike). Default "strength" if unsure.\n\n' +
     'Respond with ONLY a JSON array, no prose, no markdown fences. Each item:\n' +
-    '{"name":string,"suggestedSets":number|null,"suggestedReps":number|null,"suggestedWeight":number|null,"suggestedWeightUnit":"kg"|"lb"|null,"suggestedDistance":number|null,"suggestedDistUnit":"m"|"km"|null,"suggestedSeconds":number|null,"suggestedHeight":number|null,"suggestedHeightUnit":"in"|"cm"|null,"modality":string}\n' +
+    '{"name":string,"suggestedSets":number|null,"suggestedReps":number|null,"suggestedRepsPerSet":number[]|null,"suggestedWeight":number|null,"suggestedWeightUnit":"kg"|"lb"|null,"suggestedDistance":number|null,"suggestedDistUnit":"m"|"km"|null,"suggestedSeconds":number|null,"suggestedHeight":number|null,"suggestedHeightUnit":"in"|"cm"|null,"modality":string}\n' +
     'Use null for anything not shown. Preserve board order.';
   const res = await fetch('/api/vision', {
     method: 'POST',
@@ -212,6 +219,9 @@ async function extractExercises(base64) {
     raw:                 stripPrescription((x.name || 'Exercise').trim()),
     suggestedSets:       x.suggestedSets ?? null,
     suggestedReps:       x.suggestedReps ?? null,
+    suggestedRepsPerSet: (Array.isArray(x.suggestedRepsPerSet) && x.suggestedRepsPerSet.some((n) => typeof n === 'number' && n > 0))
+                           ? x.suggestedRepsPerSet.filter((n) => typeof n === 'number' && n > 0)
+                           : null,
     suggestedWeight:     x.suggestedWeight ?? null,
     suggestedWeightUnit: (x.suggestedWeightUnit === 'lb' || x.suggestedWeightUnit === 'kg') ? x.suggestedWeightUnit : null,
     suggestedDistance:   x.suggestedDistance ?? null,
@@ -641,14 +651,17 @@ export default function App() {
           modalityMap[nameKey(canonical)] ||
           read[i].aiModality ||
           'strength';
-        const count = read[i].suggestedSets ?? 1;
-        const sets = Array.from({ length: Math.max(1, count) }, () => {
+        const r0 = read[i];
+        // A per-set rep scheme (e.g. 5-5-4-4-3) wins: it defines both the set
+        // count and each set's reps. Otherwise fall back to sets × reps.
+        const repsArr = (r0.suggestedRepsPerSet && r0.suggestedRepsPerSet.length) ? r0.suggestedRepsPerSet : null;
+        const count = repsArr ? repsArr.length : (r0.suggestedSets ?? 1);
+        const sets = Array.from({ length: Math.max(1, count) }, (_, k) => {
           const s = emptySet(modality);
-          const r0 = read[i];
           if (modality === 'strength') {
-            s.reps = r0.suggestedReps ?? null;
+            s.reps = repsArr ? (repsArr[k] ?? null) : (r0.suggestedReps ?? null);
           } else if (modality === 'bodyweight') {
-            s.reps = r0.suggestedReps ?? null;
+            s.reps = repsArr ? (repsArr[k] ?? null) : (r0.suggestedReps ?? null);
             // Box-jump-style height: only attach the key when the board specified one
             if (r0.suggestedHeight != null) {
               s.height = r0.suggestedHeight;
