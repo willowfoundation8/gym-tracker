@@ -74,6 +74,26 @@ function isSledType(name) {
   return SLED_KEYWORDS.some((w) => k.includes(w));
 }
 
+// Body-region classifier for the progress filter. Keyword-based on the name,
+// padded with spaces for rough word boundaries. Order matters: core, then
+// lower (so "Calf Raise" wins over upper's "raise"), then upper. Cardio-modality
+// exercises short-circuit to 'cardio' (so machine "Row" ≠ "DB Row").
+const REGIONS = ['all', 'upper', 'lower', 'core', 'cardio'];
+const CORE_KEYS  = [' plank ', ' sit-up ', ' sit up ', ' situp ', ' crunch ', ' hollow ', ' v-up ', ' v up ', ' russian ', ' dead bug ', ' bird dog ', ' ab ', ' abs ', ' core ', ' mountain climber '];
+const LOWER_KEYS = [' squat ', ' lunge ', ' deadlift ', ' rdl ', ' leg ', ' calf ', ' glute ', ' hip ', ' hamstring ', ' quad ', ' adductor ', ' abductor ', ' step up ', ' step-up ', ' step over ', ' box jump ', ' wall sit ', ' sled ', ' prowler ', ' bridge ', ' thrust '];
+const UPPER_KEYS = [' press ', ' bench ', ' row ', ' pull ', ' push ', ' chin ', ' curl ', ' tricep ', ' bicep ', ' shoulder ', ' lat ', ' chest ', ' dip ', ' fly ', ' flye ', ' raise ', ' shrug ', ' snatch ', ' clean ', ' jerk ', ' pullover ', ' extension '];
+const CARDIO_KEYS = [' run ', ' sprint ', ' jog ', ' ski ', ' bike ', ' cycle ', ' erg ', ' rowing ', ' treadmill '];
+function bodyRegion(name, modality) {
+  if (modality === 'cardio') return 'cardio';
+  const k = ' ' + nameKey(name) + ' ';
+  const has = (arr) => arr.some((w) => k.includes(w));
+  if (has(CARDIO_KEYS)) return 'cardio';   // runs/sprints are distance-modality but read as cardio to a human
+  if (has(CORE_KEYS))  return 'core';
+  if (has(LOWER_KEYS)) return 'lower';
+  if (has(UPPER_KEYS)) return 'upper';
+  return 'other';
+}
+
 // Canonical exercise name (post-expansion, lower-trimmed) → modality
 const MODALITY_SEED = {
   // ── Distance (unloaded) ─────────────────────────────────────────────────────
@@ -384,6 +404,47 @@ function parseSeconds(v) {
   return isNaN(n) ? null : n;
 }
 
+// History summary for an exercise while logging: sessions count, average and
+// best of the modality's headline value, in canonical kg/m/seconds.
+// excludeId skips the workout currently being edited so it can't inflate itself.
+function exerciseStats(workouts, exerciseName, modality, excludeId) {
+  const key = nameKey(exerciseName);
+  if (!key) return null;
+  const vals = [];
+  let sessions = 0;
+  for (const w of workouts) {
+    if (excludeId && w.id === excludeId) continue;
+    const ex = w.exercises.find((e) => nameKey(e.name) === key);
+    if (!ex) continue;
+    const sets = ex.sets || [];
+    let sessionVals = [];
+    if (modality === 'strength' || modality === 'loaded_distance') {
+      sessionVals = sets.filter((s) => s.weight > 0).map((s) => toKg(s.weight, s.weightUnit));
+    } else if (modality === 'bodyweight') {
+      sessionVals = sets.filter((s) => s.reps > 0).map((s) => s.reps);
+    } else if (modality === 'duration') {
+      sessionVals = sets.filter((s) => s.seconds > 0).map((s) => s.seconds);
+    } else if (modality === 'distance' || modality === 'cardio') {
+      sessionVals = sets.filter((s) => s.distance > 0).map((s) => toMeters(s.distance, s.distUnit));
+    }
+    if (sessionVals.length) { sessions++; vals.push(...sessionVals); }
+  }
+  if (!vals.length) return null;
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const max = Math.max(...vals);
+  const kind = (modality === 'strength' || modality === 'loaded_distance') ? 'kg'
+             : modality === 'bodyweight' ? 'reps'
+             : modality === 'duration' ? 'sec' : 'm';
+  return { sessions, avg, max, kind };
+}
+
+function fmtStatVal(v, kind) {
+  if (kind === 'sec') return fmtSeconds(Math.round(v));
+  if (kind === 'm')   return fmtDist(v);
+  if (kind === 'kg')  return `${Math.round(v * 10) / 10} kg`;
+  return `${Math.round(v * 10) / 10} reps`;
+}
+
 function computeProgressData(workouts, exerciseName) {
   const key = nameKey(exerciseName);
 
@@ -674,6 +735,7 @@ export default function App() {
   const [confirmId, setConfirmId] = useState(null);   // two-tap delete guard
   const [dataMsg, setDataMsg]     = useState(null);    // export/import feedback
   const [logs, setLogs]           = useState([]);
+  const [regionFilter, setRegionFilter] = useState('all');
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
   const importRef = useRef(null);
@@ -848,10 +910,17 @@ export default function App() {
     setNames(ns);
     const first = ns[0] || null;
     setChartName(first);
-    setChartData(first ? computeProgressData(ws, first) : []);
+    const d = first ? computeProgressData(ws, first) : [];
+    setChartData(d);
+    if (d.length === 1) setChartView('scatter'); // per-set dots are the story with one session
     setScreen('progress');
   }
-  function pickChart(n) { setChartName(n); setChartData(computeProgressData(workouts, n)); }
+  function pickChart(n) {
+    setChartName(n);
+    const d = computeProgressData(workouts, n);
+    setChartData(d);
+    if (d.length === 1) setChartView('scatter');
+  }
 
   async function openLogs() { setLogs(await getLogs(50)); setScreen('logs'); }
   async function onClearLogs() { await clearLogs(); setLogs([]); }
@@ -900,6 +969,15 @@ export default function App() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
+
+  // Latest-known modality per exercise name (workouts sorted desc → first hit wins)
+  const modalityByKey = {};
+  workouts.forEach((w) => (w.exercises || []).forEach((e) => {
+    if (!(e.nameKey in modalityByKey)) modalityByKey[e.nameKey] = e.modality || 'strength';
+  }));
+  const filteredNames = regionFilter === 'all'
+    ? names
+    : names.filter((n) => bodyRegion(n, modalityByKey[nameKey(n)]) === regionFilter);
 
   const scatterPoints  = chartData.flatMap((s) => s.scatterSets || []);
   const modality       = chartData[0]?.modality || 'strength';
@@ -1114,6 +1192,12 @@ export default function App() {
                 {ex.dupCount > 1 && (
                   <div style={S.hintTag}>↻ appears {ex.dupCount}× on this board — each is logged separately</div>
                 )}
+                {(() => {
+                  const hist = exerciseStats(workouts, ex.name, mod, draft.id);
+                  return hist ? (
+                    <div style={S.histTag}>📊 {hist.sessions} session{hist.sessions === 1 ? '' : 's'} — avg {fmtStatVal(hist.avg, hist.kind)} · best {fmtStatVal(hist.max, hist.kind)}</div>
+                  ) : null;
+                })()}
 
                 {/* Set headers */}
                 <div style={S.setHeader}>
@@ -1156,8 +1240,16 @@ export default function App() {
             <div style={S.empty}>Log a few workouts and your exercise trends will show up here.</div>
           ) : (
             <>
+              <div style={{ ...S.chips, marginBottom: 8 }}>
+                {REGIONS.map((r) => (
+                  <button key={r} onClick={() => setRegionFilter(r)}
+                    style={{ ...S.chip, ...S.chipSm, ...(r === regionFilter ? S.chipOn : {}) }}>{r.toUpperCase()}</button>
+                ))}
+              </div>
               <div style={S.chips}>
-                {names.map((n) => (
+                {filteredNames.length === 0 ? (
+                  <div style={S.dataNote}>No {regionFilter} exercises logged yet.</div>
+                ) : filteredNames.map((n) => (
                   <button key={n} onClick={() => pickChart(n)}
                     style={{ ...S.chip, ...(n === chartName ? S.chipOn : {}) }}>{n}</button>
                 ))}
@@ -1186,8 +1278,8 @@ export default function App() {
                 <button style={{ ...S.toggleBtn, ...(chartView === 'scatter'  ? S.toggleOn : {}) }} onClick={() => setChartView('scatter')}>SCATTER</button>
               </div>
 
-              {chartData.length < 2 ? (
-                <div style={S.empty}>Need at least two logged sessions of "{chartName}" to chart a trend.</div>
+              {chartData.length < 1 ? (
+                <div style={S.empty}>No completed sets of "{chartName}" logged yet.</div>
               ) : (
                 <div className="gt-chart-grid">
 
@@ -1243,6 +1335,9 @@ export default function App() {
                   </div>
 
                 </div>
+              )}
+              {chartData.length === 1 && (
+                <div style={S.chartNote}>First session logged — each dot below is one set from it. The trend line starts growing with your next session.</div>
               )}
               <div style={S.note}>Next up (v1.1): personal records and streaks.</div>
             </>
@@ -1338,6 +1433,8 @@ const S = {
   guessTag:   { fontSize: 11, color: '#aeb86b', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
   rememberTag:{ fontSize: 11, color: '#6b7080', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
   hintTag:    { fontSize: 11, color: '#7fbfa0', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
+  histTag:    { fontSize: 11, color: '#6b9fff', margin: '-2px 0 8px 2px', lineHeight: 1.4 },
+  chipSm:     { padding: '5px 10px', fontSize: 10.5, letterSpacing: 0.5 },
   chips:      { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
   chip:       { padding: '7px 12px', background: '#13151b', border: '1px solid #2a2e38', borderRadius: 20, color: '#cfd3dc', fontFamily: 'inherit', fontSize: 12, cursor: 'pointer' },
   chipOn:     { background: ACCENT, color: '#0c0d10', borderColor: ACCENT, fontWeight: 500 },
