@@ -414,9 +414,9 @@ function exerciseStats(workouts, exerciseName, modality, excludeId) {
   let sessions = 0;
   for (const w of workouts) {
     if (excludeId && w.id === excludeId) continue;
-    const ex = w.exercises.find((e) => nameKey(e.name) === key);
-    if (!ex) continue;
-    const sets = ex.sets || [];
+    const matched = w.exercises.filter((e) => nameKey(e.name) === key);
+    if (!matched.length) continue;
+    const sets = matched.flatMap((e) => e.sets || []);
     let sessionVals = [];
     if (modality === 'strength' || modality === 'loaded_distance') {
       sessionVals = sets.filter((s) => s.weight > 0).map((s) => toKg(s.weight, s.weightUnit));
@@ -450,10 +450,15 @@ function computeProgressData(workouts, exerciseName) {
 
   // Pass 1: collect matching (workout, exercise) pairs so we can decide
   // whether the date range spans multiple years (labels then include 'yy).
+  // An exercise can appear MORE THAN ONCE in a workout (e.g. warmup sets +
+  // working sets as separate entries, or repeated stations). Merge every
+  // instance's sets — .find() would silently drop all but the first.
   const matches = [];
   for (const w of workouts) {
-    const ex = w.exercises.find((e) => nameKey(e.name) === key);
-    if (ex) matches.push({ w, ex });
+    const matched = w.exercises.filter((e) => nameKey(e.name) === key);
+    if (matched.length) {
+      matches.push({ w, modality: matched[0].modality || 'strength', sets: matched.flatMap((e) => e.sets || []) });
+    }
   }
   const years = new Set(matches.map(({ w }) => new Date(w.date).getFullYear()));
   const multiYear = years.size > 1;
@@ -464,9 +469,7 @@ function computeProgressData(workouts, exerciseName) {
   };
 
   const sessions = [];
-  for (const { w, ex } of matches) {
-    const modality = ex.modality || 'strength';
-    const sets = ex.sets || [];
+  for (const { w, modality, sets } of matches) {
     const label = fmtLabel(w.date);
     const base = { date: w.date, label, modality };
 
