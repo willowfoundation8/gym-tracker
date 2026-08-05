@@ -138,8 +138,10 @@ function emptySet(modality, ref) {
   const id = uid();
   switch (modality) {
     case 'bodyweight':      return { id, reps: null, weight: null, weightUnit: unit };
-    case 'distance':        return { id, distance: null, distUnit };
-    case 'loaded_distance': return { id, weight: null, weightUnit: unit, distance: null, distUnit };
+    // `seconds` is optional on both — null when the time field is left blank.
+    // Same key as duration/cardio so CSV export and setHasData work unchanged.
+    case 'distance':        return { id, distance: null, distUnit, seconds: null };
+    case 'loaded_distance': return { id, weight: null, weightUnit: unit, distance: null, distUnit, seconds: null };
     case 'duration':        return { id, seconds: null };
     case 'cardio':          return { id, distance: null, distUnit, seconds: null, resistance: 5 };
     default:                return { id, reps: null, weight: null, weightUnit: unit };  // strength

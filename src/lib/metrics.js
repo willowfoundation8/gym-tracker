@@ -110,7 +110,16 @@ function computeProgressData(workouts, exerciseName) {
       if (!valid.length) continue;
       const totalDist = valid.reduce((sum, s) => sum + s.m, 0);
       const bestDist  = Math.max(...valid.map((s) => s.m));
-      sessions.push({ ...base, totalDist: Math.round(totalDist), bestDist: Math.round(bestDist), totalSets: valid.length,
+      // Pace is optional: only sets carrying a logged time contribute. Computed
+      // from canonical metres, so a 5km and an 800m set are directly comparable.
+      // Session pace = the FASTEST set (lowest sec/km). Sessions with no time
+      // logged emit null, which the chart renders as a gap rather than
+      // interpolating a pace that was never recorded.
+      const timed = valid.filter((s) => s.seconds > 0);
+      const paceSecPerKm = timed.length
+        ? Math.round(Math.min(...timed.map((s) => s.seconds / (s.m / 1000))))
+        : null;
+      sessions.push({ ...base, totalDist: Math.round(totalDist), bestDist: Math.round(bestDist), paceSecPerKm, totalSets: valid.length,
         scatterSets: valid.map((s) => ({ date: w.date, label, mod: 'distance', weight: Math.round(s.m), unit: 'm', reps: 1, z: 20 })) });
 
     } else if (modality === 'loaded_distance') {
@@ -163,7 +172,7 @@ function computeProgressData(workouts, exerciseName) {
 const CHART_CONFIG = {
   strength:        { primary: 'e1rm',        primaryLabel: 'e1RM (kg)',    primaryUnit: 'kg', secondary: 'volume',       secondaryLabel: 'Volume (kg)',    secondaryUnit: 'kg', note: 'e1RM normalises any set to a "max effort" number — heavy singles and volume sets become comparable.' },
   bodyweight:      { primary: 'maxReps',     primaryLabel: 'Max reps',     primaryUnit: '',   secondary: 'totalReps',    secondaryLabel: 'Total reps',     secondaryUnit: '',   note: 'Max reps is the best single set. Total reps shows overall volume done that session.' },
-  distance:        { primary: 'bestDist',    primaryLabel: 'Best set (m)', primaryUnit: 'm',  secondary: 'totalDist',    secondaryLabel: 'Total dist (m)', secondaryUnit: 'm',  note: 'Best set distance per session. Total shows cumulative distance covered.' },
+  distance:        { primary: 'bestDist',    primaryLabel: 'Best set (m)', primaryUnit: 'm',  secondary: 'totalDist',    secondaryLabel: 'Total dist (m)', secondaryUnit: 'm',  tertiary: 'paceSecPerKm', tertiaryLabel: 'Pace (/km)', note: 'Best set distance per session. Total shows cumulative distance covered. The dashed pace line only appears for sessions where you logged a time — lower is faster, and a gap means no time was recorded that session.' },
   loaded_distance: { primary: 'work',        primaryLabel: 'Work (kg·m)',  primaryUnit: '',   secondary: 'topWeight',    secondaryLabel: 'Best load (kg)', secondaryUnit: 'kg', note: 'Work = load × distance. The load bar shows whether progression came from heavier weight or more distance.' },
   duration:        { primary: 'bestSeconds', primaryLabel: 'Best hold',    primaryUnit: '',   secondary: 'totalSeconds', secondaryLabel: 'Total (s)',      secondaryUnit: 's',  note: 'Best single hold duration per session.' },
   cardio:          { primary: 'effort',      primaryLabel: 'Effort score', primaryUnit: '',   secondary: 'totalDist',    secondaryLabel: 'Distance (m)',   secondaryUnit: 'm',  note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },

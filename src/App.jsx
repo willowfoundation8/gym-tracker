@@ -19,7 +19,7 @@ import {
   SetRowStrength, SetRowBodyweight, SetRowDistance,
   SetRowLoadedDistance, SetRowDuration, SetRowCardio, SET_HEADERS,
 } from './components/SetRows';
-import { CombinedTooltip, ScatterTooltip } from './components/Tooltips';
+import { CombinedTooltip, ScatterTooltip, InfoTip, WEIGHT_CONVENTION } from './components/Tooltips';
 import { ACCENT, BLUE, S } from './styles';
 
 export default function App() {
@@ -500,10 +500,14 @@ export default function App() {
                   ) : null;
                 })()}
 
-                {/* Set headers */}
-                <div style={S.setHeader}>
+                {/* Set headers. position:relative anchors the InfoTip popover
+                    to the full header width so it can't overflow the screen. */}
+                <div style={{ ...S.setHeader, position: 'relative' }}>
                   {headers.map((h, hi) => (
-                    <span key={hi} style={hi === 0 ? { width: 28 } : hi === headers.length - 1 ? { width: 28 } : S.col}>{h}</span>
+                    <span key={hi} style={hi === 0 ? { width: 28 } : hi === headers.length - 1 ? { width: 28 } : S.col}>
+                      {h}
+                      {(h === 'weight' || h === '+wt') && <InfoTip text={WEIGHT_CONVENTION} />}
+                    </span>
                   ))}
                 </div>
 
@@ -588,6 +592,7 @@ export default function App() {
                   <div className="gt-chart-panel" style={chartView !== 'combined' ? { display: 'none' } : {}}>
                     <div style={S.chartCaption}>
                       <span style={{ color: ACCENT }}>━</span> {cfg.primaryLabel} &nbsp;·&nbsp; <span style={{ color: BLUE }}>▪</span> {cfg.secondaryLabel}
+                      {cfg.tertiary && <> &nbsp;·&nbsp; <span style={{ color: '#ffb247' }}>┄</span> {cfg.tertiaryLabel}</>}
                     </div>
                     <div className="gt-chart-height" style={{ marginTop: 6 }}>
                       <ResponsiveContainer width="100%" height="100%">
@@ -597,8 +602,14 @@ export default function App() {
                           <YAxis yAxisId="primary"   orientation="left"  tick={{ fill: '#8b909c', fontSize: 10 }} width={38} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
                           <YAxis yAxisId="secondary" orientation="right" tick={{ fill: BLUE,      fontSize: 10 }} width={42} tickFormatter={(v) => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v} />
                           <Tooltip content={<CombinedTooltip />} />
+                          {/* Pace rides its own hidden axis — sec/km shares no
+                              scale with metres, so putting it on either visible
+                              axis would squash it flat. connectNulls={false}
+                              leaves gaps for sessions logged without a time. */}
+                          {cfg.tertiary && <YAxis yAxisId="tertiary" hide domain={['dataMin - 45', 'dataMax + 45']} />}
                           <Bar  yAxisId="secondary" dataKey={cfg.secondary} fill={BLUE}   opacity={0.45} radius={[3,3,0,0]} />
                           <Line yAxisId="primary"   dataKey={cfg.primary}   stroke={ACCENT} strokeWidth={2.5} dot={{ fill: ACCENT, r: 3 }} connectNulls />
+                          {cfg.tertiary && <Line yAxisId="tertiary" dataKey={cfg.tertiary} stroke="#ffb247" strokeWidth={2} strokeDasharray="4 3" dot={{ fill: '#ffb247', r: 3 }} connectNulls={false} />}
                         </ComposedChart>
                       </ResponsiveContainer>
                     </div>

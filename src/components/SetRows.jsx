@@ -34,11 +34,31 @@ function SetRowBodyweight({ s, onUpdate, num, parseNum }) {
   );
 }
 
+// Optional mm:ss time, shared by distance + loaded_distance. Same raw-string-
+// while-typing / commit-on-blur pattern as SetRowDuration, with one difference:
+// a blank field commits null, so an optional time can be cleared again.
+function TimeInput({ s, onUpdate }) {
+  const [raw, setRaw] = useState(secToInput(s.seconds));
+  useEffect(() => { setRaw(secToInput(s.seconds)); }, [s.seconds]);
+  return (
+    <input
+      style={S.setInput}
+      type="text"
+      inputMode="numeric"
+      placeholder="mm:ss"
+      value={raw}
+      onChange={(e) => setRaw(e.target.value)}
+      onBlur={() => onUpdate({ seconds: parseSeconds(raw) })}
+    />
+  );
+}
+
 function SetRowDistance({ s, onUpdate, num, parseNum }) {
   return (
     <>
-      <input style={{ ...S.setInput, flex: 2 }} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
+      <input style={S.setInput} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
       <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
+      <TimeInput s={s} onUpdate={onUpdate} />
     </>
   );
 }
@@ -51,6 +71,7 @@ function SetRowLoadedDistance({ s, onUpdate, num, parseNum, sled }) {
       <button style={S.unitBtn} onClick={() => onUpdate({ weightUnit: s.weightUnit === 'kg' ? 'lb' : 'kg' })}>{s.weightUnit || 'kg'}</button>
       <input style={S.setInput} type="number" inputMode="decimal" placeholder="dist" value={num(s.distance)} onChange={(e) => onUpdate({ distance: parseNum(e.target.value) })} />
       <button style={S.unitBtn} onClick={() => onUpdate({ distUnit: s.distUnit === 'm' ? 'km' : 'm' })}>{s.distUnit || 'm'}</button>
+      <TimeInput s={s} onUpdate={onUpdate} />
     </>
   );
 }
@@ -103,8 +124,8 @@ function SetRowCardio({ s, onUpdate, num, parseNum }) {
 const SET_HEADERS = {
   strength:        ['#', 'reps', 'weight', 'unit', ''],
   bodyweight:      ['#', 'reps', '+wt', 'unit', ''],
-  distance:        ['#', 'distance', 'unit', ''],
-  loaded_distance: ['#', 'weight', 'unit', 'dist', 'unit', ''],
+  distance:        ['#', 'distance', 'unit', 'time', ''],
+  loaded_distance: ['#', 'weight', 'unit', 'dist', 'unit', 'time', ''],
   duration:        ['#', 'time (mm:ss)', ''],
   cardio:          ['#', 'dist', 'unit', 'time', 'resist', ''],
 };
