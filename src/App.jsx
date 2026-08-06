@@ -8,6 +8,7 @@ import {
   getExerciseNames, learnAbbrev, nameKey, getModalityMap, learnModality,
   exportAll, importAll, exportCSV, logEvent, getLogs, clearLogs,
   getSession, onAuthChange, signInGoogle, signOut,
+  syncNow, getSyncState, resetLocalData,
 } from './db';
 import { uid, withRetry, fmtSeconds } from './lib/helpers';
 import {
@@ -40,6 +41,9 @@ export default function App() {
   const [regionFilter, setRegionFilter] = useState('all');
   const [session, setSession]     = useState(null);   // null = signed out
   const [authErr, setAuthErr]     = useState(null);
+  const [syncState, setSyncState] = useState({ signedIn: false, lastPushedAt: null, pending: 0 });
+  const [syncing, setSyncing]     = useState(false);
+  const [resetArmed, setResetArmed] = useState(false);   // two-tap wipe guard
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
   const importRef = useRef(null);
@@ -69,6 +73,43 @@ export default function App() {
     setAuthErr(null);
     try { await signOut(); }
     catch (e) { setAuthErr('Sign out failed: ' + (e.message || 'unknown error')); }
+  }
+
+  // ── Sync (phase 4: push only) ──
+  const refreshSync = async () => setSyncState(await getSyncState());
+
+  // Fire-and-forget. Never awaited by a save — a sync failure must not block
+  // logging a set, and failed rows simply stay dirty for the next attempt.
+  const triggerSync = (reason) => { syncNow(reason).then(refreshSync).catch(() => {}); };
+
+  useEffect(() => {
+    refreshSync();
+    if (session) triggerSync('app_open');
+  }, [session]);
+
+  async function onSyncNow() {
+    setSyncing(true);
+    const r = await syncNow('manual');
+    setSyncing(false);
+    await refresh();          // a pull may have changed what's on screen
+    await refreshSync();
+    setAuthErr(r.ok || r.skipped || r.blocked ? null : 'Sync failed: ' + (r.error || 'unknown error'));
+  }
+
+  // Account switch: this device's data belongs to someone else. Destructive,
+  // so it's two-tap and always exports a backup first — never a bare wipe.
+  async function onResetLocal() {
+    if (!resetArmed) {
+      setResetArmed(true);
+      setTimeout(() => setResetArmed(false), 4000);
+      return;
+    }
+    setResetArmed(false);
+    await onExportJSON();     // backup lands in Downloads before anything goes
+    await resetLocalData();
+    await refresh();
+    await refreshSync();
+    triggerSync('after_reset');
   }
 
   function openUpload() { setVisionErr(null); fileRef.current?.click(); }
@@ -199,6 +240,7 @@ export default function App() {
     await saveWorkout(cleaned);
     setDraft(null); setPreview(null);
     await refresh();
+    triggerSync('save');
     setScreen('home');
   }
 
@@ -217,7 +259,7 @@ export default function App() {
       setScreen('edit');
     }
   }
-  async function remove(id) { await deleteWorkout(id); setConfirmId(null); await refresh(); }
+  async function remove(id) { await deleteWorkout(id); setConfirmId(null); await refresh(); triggerSync('delete'); }
   // First tap arms the delete; second tap (within 3s) performs it.
   function askRemove(ev, id) {
     ev.stopPropagation();
@@ -431,12 +473,34 @@ export default function App() {
                 </div>
                 <button style={{ ...S.dataBtn, flex: '0 0 auto', padding: '10px 14px' }} onClick={onSignOut}>Sign out</button>
               </div>
-              <div style={S.dataNote}>Workouts are still stored on this device only — syncing arrives in a later update. Signing out keeps them.</div>
+              {syncState.wrongAccount ? (
+                <div style={S.errBox}>
+                  The workouts on this device belong to a different account, so syncing is paused — otherwise they would upload under yours.
+                  Sign back in with the original account, or clear this device to start fresh.
+                  <button
+                    style={{ ...S.dataBtn, width: '100%', marginTop: 10, ...(resetArmed ? { color: '#ff5a6e', borderColor: '#5a2330' } : {}) }}
+                    onClick={onResetLocal}
+                  >{resetArmed ? 'Tap again — this erases local workouts' : '⬇ Back up & clear this device'}</button>
+                </div>
+              ) : (
+                <>
+                  <div style={S.dataRow}>
+                    <button style={S.dataBtn} onClick={onSyncNow} disabled={syncing}>{syncing ? '⟳ Syncing…' : '⟳ Sync now'}</button>
+                  </div>
+                  <div style={S.dataNote}>
+                    {syncState.lastPushedAt
+                      ? `Last synced ${new Date(syncState.lastPushedAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
+                      : 'Not synced yet'}
+                    {syncState.pending > 0 && ` · ${syncState.pending} waiting to upload`}
+                    . Your workouts are saved to your account — sign in on another device to pick them up there. Signing out keeps them on this device too.
+                  </div>
+                </>
+              )}
             </>
           ) : (
             <>
               <button style={S.ghost} className="gt-ghost" onClick={onSignIn}>SIGN IN WITH GOOGLE</button>
-              <div style={S.dataNote}>Optional. Signing in links your Google account so workouts can sync across devices in a later update — the app works fully without it.</div>
+              <div style={S.dataNote}>Optional. Sign in and your workouts are saved to your account, so they follow you to a new phone. The app works fully without it.</div>
             </>
           )}
           {authErr && <div style={S.errBox}>{authErr}</div>}

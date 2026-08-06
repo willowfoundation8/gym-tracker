@@ -24,6 +24,13 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   },
 });
 
+// Exposed for diagnostics: lets you run a query from the browser console with
+// the real anon key and the real session, exactly as the app does — the only
+// honest way to check RLS from outside, since the SQL editor runs as superuser
+// and bypasses it. Harmless: the key is public and the session is the user's
+// own, and no third-party scripts run on this page.
+if (typeof window !== 'undefined') window.__sb = supabase;
+
 // Full-page redirect rather than a popup. An installed iOS PWA has no popup
 // surface — a popup either fails silently or opens a detached Safari window
 // the app never hears back from.

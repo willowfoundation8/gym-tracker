@@ -26,16 +26,42 @@ db.version(3).stores({
   logs:       'id, ts',  // { id, ts, level, event, detail }
 });
 
+// Version 4: sync support.
+//   `dirty` — indexed flag marking rows that still need pushing.
+//   `meta`  — sync bookkeeping: { key, value }.
+// Existing records are untouched by this migration; they simply carry no
+// `dirty` property until the first-login migration marks them.
+//
+// IMPORTANT: `dirty` and `deleted` are stored as 1/0, never true/false.
+// IndexedDB cannot index booleans — a record with `dirty: true` is absent
+// from the index entirely, so `where('dirty').equals(1)` would silently match
+// nothing and NOTHING WOULD EVER SYNC, with no error anywhere.
+db.version(4).stores({
+  workouts:   'id, date, dirty',
+  abbrevs:    'key',
+  modalities: 'key',
+  logs:       'id, ts',
+  meta:       'key',     // { key, value }
+});
+
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 const now  = () => new Date().toISOString();
 export const nameKey = (n) => (n || '').toLowerCase().trim().replace(/\s+/g, ' ');
 
 // ── Workouts ────────────────────────────────────────────────────────────────
+// Deletes are soft from v4 on: the row survives as a tombstone so the deletion
+// can propagate to other devices, and is hard-deleted locally once pushed.
+// Every read path therefore has to exclude tombstones — the design doc claimed
+// the UI already did this, but it did not, and without these filters a deleted
+// workout simply reappears.
+const isLive = (w) => w && !w.deleted;
+
 export async function getWorkouts() {
-  return (await db.workouts.toArray()).sort((a, b) => new Date(b.date) - new Date(a.date));
+  return (await db.workouts.toArray()).filter(isLive).sort((a, b) => new Date(b.date) - new Date(a.date));
 }
 export async function getWorkout(id) {
-  return (await db.workouts.get(id)) || null;
+  const w = await db.workouts.get(id);
+  return isLive(w) ? w : null;
 }
 export async function saveWorkout(w) {
   const id       = w.id || uuid();
@@ -59,19 +85,28 @@ export async function saveWorkout(w) {
     })),
     createdAt: existing?.createdAt || ts,
     updatedAt: ts,
+    deleted: 0,   // a save always un-deletes; 1/0 not boolean (see v4 note)
+    dirty:   1,   // needs pushing
   };
   await db.workouts.put(record);
   return id;
 }
+
+// Soft delete: keep the row as a tombstone so the deletion reaches other
+// devices. sync.js hard-deletes it locally once the tombstone is pushed.
+// A workout that was never saved to the cloud still goes through the same
+// path — the tombstone is cheap and the flow stays uniform.
 export async function deleteWorkout(id) {
-  await db.workouts.delete(id);
+  const existing = await db.workouts.get(id);
+  if (!existing) return;
+  await db.workouts.put({ ...existing, deleted: 1, dirty: 1, updatedAt: now() });
 }
 
 // ── Exercise rollups ─────────────────────────────────────────────────────────
 // Names ordered by most-recent use (class programming repeats — recency beats
 // the alphabet for the progress picker).
 export async function getExerciseNames() {
-  const all = (await db.workouts.toArray()).sort((a, b) => new Date(b.date) - new Date(a.date));
+  const all = (await db.workouts.toArray()).filter(isLive).sort((a, b) => new Date(b.date) - new Date(a.date));
   const seen = new Map();
   all.forEach((w) => (w.exercises || []).forEach((e) => {
     if (!seen.has(e.nameKey)) seen.set(e.nameKey, e.name);
@@ -83,7 +118,7 @@ export async function getExerciseNames() {
 // but external tooling or future features may.
 export async function getExerciseHistory(name) {
   const key = nameKey(name);
-  const all = await db.workouts.toArray();
+  const all = (await db.workouts.toArray()).filter(isLive);
   const pts = [];
   all.forEach((w) => (w.exercises || []).forEach((e) => {
     if (e.nameKey === key) {
@@ -131,10 +166,12 @@ export async function learnModality(entries) {
    CSV  = one row per set, for spreadsheets.
 =========================================================================== */
 export async function exportAll() {
+  // Deliberately includes tombstones: this is a full-fidelity backup, and a
+  // restore that dropped them would resurrect every workout you ever deleted.
   const [workouts, abbrevs, modalities] = await Promise.all([
     db.workouts.toArray(), db.abbrevs.toArray(), db.modalities.toArray(),
   ]);
-  return { app: 'GymTracker', schemaVersion: 2, exportedAt: now(), workouts, abbrevs, modalities };
+  return { app: 'GymTracker', schemaVersion: 4, exportedAt: now(), workouts, abbrevs, modalities };
 }
 
 // Merge semantics: bulkPut upserts by primary key. Existing records with the
@@ -182,8 +219,69 @@ export function workoutsToCSV(workouts) {
 }
 
 export async function exportCSV() {
-  const ws = (await db.workouts.toArray()).sort((a, b) => new Date(a.date) - new Date(b.date));
+  // CSV is for analysis — tombstones would be noise. JSON export keeps them.
+  const ws = (await db.workouts.toArray()).filter(isLive).sort((a, b) => new Date(a.date) - new Date(b.date));
   return workoutsToCSV(ws);
+}
+
+/* ===========================================================================
+   SYNC PRIMITIVES — local bookkeeping only. The push engine lives in sync.js;
+   these are the Dexie-level operations it composes.
+=========================================================================== */
+
+// meta: small key/value store for sync state (lastPushedAt, migration flags).
+export async function getMeta(key, fallback = null) {
+  const row = await db.meta.get(key);
+  return row ? row.value : fallback;
+}
+export async function setMeta(key, value) {
+  await db.meta.put({ key, value });
+}
+
+// Rows awaiting push. Matches on the numeric index — see the v4 schema note.
+export async function getDirtyWorkouts() {
+  return db.workouts.where('dirty').equals(1).toArray();
+}
+
+// Which account this device's data belongs to. Local rows carry no user_id of
+// their own, and a push stamps whoever is signed in — so without this, signing
+// in on a device holding someone else's workouts would upload them under the
+// new account. Set on first sync; checked on every sync thereafter.
+export const getOwner = () => getMeta('ownerUserId');
+export const setOwner = (userId) => setMeta('ownerUserId', userId);
+
+// Destructive: wipes this device's data so a different account can start
+// clean. Diagnostics logs are kept deliberately — they are the record of what
+// happened, and are not user data.
+export async function resetLocalData() {
+  await db.transaction('rw', db.workouts, db.abbrevs, db.modalities, db.meta, async () => {
+    await Promise.all([db.workouts.clear(), db.abbrevs.clear(), db.modalities.clear(), db.meta.clear()]);
+  });
+  logEvent('warn', 'local_data_reset', 'device data cleared for account switch');
+}
+
+// One-time migration: everything predating sync has no `dirty` property, so
+// it is invisible to the index and would never upload. Idempotent — ids are
+// UUIDs, so re-running it just re-uploads the same rows.
+export async function markAllDirty() {
+  const all = await db.workouts.toArray();
+  if (all.length) await db.workouts.bulkPut(all.map((w) => ({ ...w, dirty: 1 })));
+  return all.length;
+}
+
+// Called only after the server has confirmed the write. Tombstones are hard
+// -deleted (their job is done once the deletion is recorded server-side);
+// everything else just loses its dirty flag.
+export async function afterPush(pushed) {
+  const tombstones = pushed.filter((p) => p.deleted).map((p) => p.id);
+  const survivors  = pushed.filter((p) => !p.deleted).map((p) => p.id);
+  await db.transaction('rw', db.workouts, async () => {
+    if (tombstones.length) await db.workouts.bulkDelete(tombstones);
+    for (const id of survivors) {
+      const w = await db.workouts.get(id);
+      if (w) await db.workouts.put({ ...w, dirty: 0 });
+    }
+  });
 }
 
 /* ===========================================================================
