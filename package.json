@@ -7,6 +7,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.1",
     "dexie": "^4",
     "react": "^18",
     "react-dom": "^18",

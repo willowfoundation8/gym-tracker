@@ -7,6 +7,7 @@ import {
   getWorkouts, getWorkout, saveWorkout, deleteWorkout,
   getExerciseNames, learnAbbrev, nameKey, getModalityMap, learnModality,
   exportAll, importAll, exportCSV, logEvent, getLogs, clearLogs,
+  getSession, onAuthChange, signInGoogle, signOut,
 } from './db';
 import { uid, withRetry, fmtSeconds } from './lib/helpers';
 import {
@@ -37,6 +38,8 @@ export default function App() {
   const [dataMsg, setDataMsg]     = useState(null);    // export/import feedback
   const [logs, setLogs]           = useState([]);
   const [regionFilter, setRegionFilter] = useState('all');
+  const [session, setSession]     = useState(null);   // null = signed out
+  const [authErr, setAuthErr]     = useState(null);
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
   const importRef = useRef(null);
@@ -48,6 +51,25 @@ export default function App() {
     if (chartName) setChartData(computeProgressData(ws, chartName));
   }
   useEffect(() => { refresh(); }, []);
+
+  // Auth is identity only in this phase — no data moves. Read any persisted
+  // session on load (the OAuth redirect returns here with tokens in the URL,
+  // which supabase-js consumes during client init), then track changes.
+  useEffect(() => {
+    getSession().then(setSession);
+    return onAuthChange(setSession);
+  }, []);
+
+  async function onSignIn() {
+    setAuthErr(null);
+    try { await signInGoogle(); }               // navigates away to Google
+    catch (e) { setAuthErr('Sign-in failed: ' + (e.message || 'unknown error')); }
+  }
+  async function onSignOut() {
+    setAuthErr(null);
+    try { await signOut(); }
+    catch (e) { setAuthErr('Sign out failed: ' + (e.message || 'unknown error')); }
+  }
 
   function openUpload() { setVisionErr(null); fileRef.current?.click(); }
   function openCamera() { setVisionErr(null); cameraRef.current?.click(); }
@@ -397,6 +419,27 @@ export default function App() {
           </div>
           {dataMsg && <div style={S.dataMsg}>{dataMsg}</div>}
           <div style={S.dataNote}>Your data lives in this browser only. Back it up occasionally — clearing browser data wipes it.</div>
+
+          {/* No login wall by design — the app is fully usable signed out. */}
+          <div style={S.label}>ACCOUNT</div>
+          {session ? (
+            <>
+              <div style={{ ...S.row, cursor: 'default' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={S.rowDate}>SIGNED IN</div>
+                  <div style={S.rowMeta}>{session.user?.email || 'Google account'}</div>
+                </div>
+                <button style={{ ...S.dataBtn, flex: '0 0 auto', padding: '10px 14px' }} onClick={onSignOut}>Sign out</button>
+              </div>
+              <div style={S.dataNote}>Workouts are still stored on this device only — syncing arrives in a later update. Signing out keeps them.</div>
+            </>
+          ) : (
+            <>
+              <button style={S.ghost} className="gt-ghost" onClick={onSignIn}>SIGN IN WITH GOOGLE</button>
+              <div style={S.dataNote}>Optional. Signing in links your Google account so workouts can sync across devices in a later update — the app works fully without it.</div>
+            </>
+          )}
+          {authErr && <div style={S.errBox}>{authErr}</div>}
         </div>
       )}
 
