@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import {
   getWorkouts, getWorkout, saveWorkout, deleteWorkout,
-  getExerciseNames, learnAbbrev, nameKey, getModalityMap, learnModality,
+  getExerciseNames, learnAbbrev, nameKey, getModalityMap, learnModality, getExerciseMeta,
   exportAll, importAll, exportCSV, logEvent, getLogs, clearLogs,
   getSession, onAuthChange, signInGoogle, signOut,
   syncNow, getSyncState, resetLocalData,
@@ -16,10 +16,10 @@ import {
   MODALITY_LABELS, WORKOUT_TYPES, WORKOUT_TYPE_LABELS, REGIONS,
   bodyRegion, emptySet, nextModality, isSledType, seedModality,
 } from './lib/modality';
-import { fileToImage, extractExercises, resolveNames } from './lib/vision';
+import { fileToImage, extractExercises, resolveNames, expandViaAI, normalizeExpansion } from './lib/vision';
 import {
   computeProgressData, exerciseStats, fmtStatVal, CHART_CONFIG,
-  lastSession, fmtSetSummary, fmtAgo,
+  lastSession, fmtSetSummary, fmtAgo, findSimilarReference,
 } from './lib/metrics';
 import { ExerciseNameInput } from './components/ExerciseNameInput';
 import {
@@ -49,6 +49,8 @@ export default function App() {
   const [syncState, setSyncState] = useState({ signedIn: false, lastPushedAt: null, pending: 0 });
   const [syncing, setSyncing]     = useState(false);
   const [resetArmed, setResetArmed] = useState(false);   // two-tap wipe guard
+  const [exerciseMeta, setExerciseMeta] = useState({});  // key -> {modality, family, equipment}
+  const [dismissedHints, setDismissedHints] = useState([]);  // session-only, by exercise id
   const fileRef   = useRef(null);
   const cameraRef = useRef(null);
   const importRef = useRef(null);
@@ -57,6 +59,7 @@ export default function App() {
     const ws = await getWorkouts();
     setWorkouts(ws);
     setNames(await getExerciseNames());
+    setExerciseMeta(await getExerciseMeta());
     if (chartName) setChartData(computeProgressData(ws, chartName));
   }
   useEffect(() => { refresh(); }, []);
@@ -183,7 +186,7 @@ export default function App() {
           }
           return s;
         });
-        return { id: uid(), name: canonical, original: r.original, status: r.status, guessed: r.status !== 'remembered', modality, sets };
+        return { id: uid(), name: canonical, original: r.original, status: r.status, guessed: r.status !== 'remembered', modality, sets, family: r.family, equipment: r.equipment };
       });
       // Flag exercises the board listed more than once (kept separate by design —
       // e.g. paired stations that repeat — but worth a heads-up).
@@ -282,9 +285,12 @@ export default function App() {
       .map((e) => ({ raw: e.original, name: (e.name || '').trim() })));
     // Learn the FINAL modality for every exercise — including 'strength' — so a
     // user correction overwrites a stale wrong entry in the learned store.
+    // family/equipment ride along when the board read produced them; the
+    // read-merge-write in learnModality means a save without them never
+    // erases what an earlier one learned.
     await learnModality(cleaned.exercises
       .filter((e) => e.modality)
-      .map((e) => ({ name: e.name, modality: e.modality })));
+      .map((e) => ({ name: e.name, modality: e.modality, family: e.family, equipment: e.equipment })));
     await saveWorkout(cleaned);
     setDraft(null); setPreview(null);
     await refresh();
@@ -380,6 +386,45 @@ export default function App() {
       setDataMsg('Import failed: ' + (err.message || 'not a valid backup file'));
     } finally {
       if (importRef.current) importRef.current.value = '';
+    }
+  }
+
+  // Backfill family/equipment for history logged before this existed.
+  // User-triggered rather than automatic on startup: it costs an API call, and
+  // a failure should be visible and retryable rather than leaving the table
+  // half-populated in silence. Idempotent — it only asks about names that
+  // still lack a family, so re-running it is safe.
+  async function onMatchExercises() {
+    setDataMsg('Matching up exercises…');
+    try {
+      const meta = await getExerciseMeta();
+      const todo = names.filter((n) => !meta[nameKey(n)]?.family);
+      if (!todo.length) { setDataMsg('All exercises are already matched up.'); return; }
+
+      let matched = 0;
+      // Chunked: one request per ~20 names keeps each response well inside
+      // the proxy's max_tokens, and a failure only loses that chunk.
+      for (let i = 0; i < todo.length; i += 20) {
+        const chunk = todo.slice(i, i + 20);
+        const res = await expandViaAI(chunk);
+        const entries = chunk.map((n) => {
+          const norm = normalizeExpansion(res?.[n] ?? res?.[nameKey(n)]);
+          if (!norm?.family) return null;
+          return {
+            name: n,
+            modality: modalityByKey[nameKey(n)] || 'strength',
+            family: norm.family,
+            equipment: norm.equipment,
+          };
+        }).filter(Boolean);
+        if (entries.length) { await learnModality(entries); matched += entries.length; }
+      }
+      setExerciseMeta(await getExerciseMeta());
+      setDataMsg(`Matched ${matched} of ${todo.length} exercise${todo.length === 1 ? '' : 's'}.`);
+      logEvent('info', 'family_backfill', `${matched}/${todo.length}`);
+    } catch (e) {
+      setDataMsg('Matching failed: ' + (e.message || 'unknown error'));
+      logEvent('error', 'family_backfill_failed', e.message);
     }
   }
 
@@ -513,6 +558,9 @@ export default function App() {
             <button style={S.dataBtn} onClick={onExportCSV}>⬇ CSV</button>
             <button style={S.dataBtn} onClick={() => importRef.current?.click()}>⬆ Restore</button>
             <button style={S.dataBtn} onClick={openLogs}>🪵 Logs</button>
+          </div>
+          <div style={{ ...S.dataRow, marginTop: 8 }}>
+            <button style={S.dataBtn} onClick={onMatchExercises}>🔗 Match up my exercises</button>
           </div>
           {dataMsg && <div style={S.dataMsg}>{dataMsg}</div>}
           <div style={S.dataNote}>Your data lives in this browser only. Back it up occasionally — clearing browser data wipes it.</div>
@@ -689,6 +737,24 @@ export default function App() {
                     >
                       ⏱ Last time, {fmtAgo(last.date)} — {done.map((s) => fmtSetSummary(s, last.modality)).join(', ')}
                       <span style={{ color: '#6b7080' }}> · tap to fill</span>
+                    </div>
+                  );
+                })()}
+                {/* Fallback for a movement you've never done: borrow a number
+                    from a related one. Suppressed the moment you have any
+                    history of your own — findSimilarReference enforces that,
+                    so this can't compete with the line above. */}
+                {(() => {
+                  if (dismissedHints.includes(ex.id)) return null;
+                  const sim = findSimilarReference(workouts, exerciseMeta, ex.name, mod, draft.id);
+                  if (!sim) return null;
+                  return (
+                    <div
+                      style={{ ...S.guessTag, cursor: 'pointer' }}
+                      onClick={() => setDismissedHints((h) => [...h, ex.id])}
+                    >
+                      💡 Similar: {sim.name} — {fmtSetSummary(sim.set, sim.modality)}, {fmtAgo(sim.date)}
+                      <span style={{ color: '#6b7080' }}> · tap to dismiss</span>
                     </div>
                   );
                 })()}

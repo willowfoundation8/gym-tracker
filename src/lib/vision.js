@@ -98,12 +98,38 @@ function stripPrescription(name) {
   return name.replace(/^\s*\d+\s*[x×]\s*/i, '').trim() || name;
 }
 
+const EQUIPMENT = ['barbell', 'dumbbell', 'machine', 'cable', 'bodyweight', 'other'];
+
+// Normalises one expansion. Accepts the old string shape as well as the
+// object shape, so a cached/stale/partial response can never turn an exercise
+// name into "[object Object]" on screen.
+function normalizeExpansion(v) {
+  if (typeof v === 'string') return { name: v, family: null, equipment: null };
+  if (v && typeof v === 'object' && typeof v.name === 'string') {
+    const fam = typeof v.family === 'string' ? v.family.trim().toLowerCase() : '';
+    return {
+      name: v.name,
+      family: fam || null,
+      // Validate against the known set — models occasionally return values
+      // outside a specified enum. Family stays free text: the set of human
+      // movements can't be enumerated.
+      equipment: EQUIPMENT.includes(v.equipment) ? v.equipment : 'other',
+    };
+  }
+  return null;
+}
+
 async function expandViaAI(rawList) {
   const prompt =
     'These are exercise names written in shorthand on a gym workout board. ' +
     'Expand each to its full, standard exercise name (e.g. "DB SA Row" -> "Dumbbell Single Arm Row", "BB OHP" -> "Barbell Overhead Press"). ' +
     'IMPORTANT: strip any leftover prescription from the name — leading rep/set counts ("28x", "3x"), distances ("5km"), or durations ("30s"). Return ONLY the clean movement name. KEEP qualifiers like "Single Arm", "Single Leg", "Double Under". ' +
-    'Keep names concise and standard. Respond with ONLY a JSON object mapping each EXACT input string to its expanded name - no prose, no markdown fences.\n\nInputs: ' +
+    'Keep names concise and standard.\n\n' +
+    'Also classify each movement:\n' +
+    '- "family": the canonical movement in snake_case, IGNORING equipment and variation. "Dumbbell Bench Press", "Barbell Bench Press" and "Machine Chest Press" all share family "bench_press". Examples: bench_press, squat, deadlift, row, overhead_press, curl, lunge, pulldown, fly, calf_raise.\n' +
+    `- "equipment": exactly one of ${JSON.stringify(EQUIPMENT)}.\n\n` +
+    'Respond with ONLY a JSON object mapping each EXACT input string to ' +
+    '{"name":string,"family":string,"equipment":string} - no prose, no markdown fences.\n\nInputs: ' +
     JSON.stringify(rawList);
   const res = await fetch('/api/expand', {
     method: 'POST',
@@ -131,15 +157,21 @@ async function resolveNames(rawList) {
   if (unknown.length) {
     try {
       const suggestions = await expandViaAI([...new Set(unknown)]);
-      Object.entries(suggestions || {}).forEach(([k, v]) => { sugByKey[nameKey(k)] = v; });
+      Object.entries(suggestions || {}).forEach(([k, v]) => {
+        const norm = normalizeExpansion(v);
+        if (norm) sugByKey[nameKey(k)] = norm;
+      });
     } catch (e) { logEvent('warn', 'expand_fallback', e.message + ' — names kept raw'); sugByKey = {}; }
   }
   return rawList.map((raw) => {
     const key = nameKey(raw);
-    if (map[key]) return { name: map[key], original: raw, status: 'remembered' };
-    if (sugByKey[key]) return { name: sugByKey[key], original: raw, status: 'suggested' };
-    return { name: raw, original: raw, status: 'unknown' };
+    // A remembered name carries no family/equipment — that's fine, the
+    // learned store already holds them from when it was first expanded.
+    if (map[key]) return { name: map[key], original: raw, status: 'remembered', family: null, equipment: null };
+    const s = sugByKey[key];
+    if (s) return { name: s.name, original: raw, status: 'suggested', family: s.family, equipment: s.equipment };
+    return { name: raw, original: raw, status: 'unknown', family: null, equipment: null };
   });
 }
 
-export { fileToImage, extractExercises, expandViaAI, resolveNames, stripPrescription };
+export { fileToImage, extractExercises, expandViaAI, resolveNames, stripPrescription, normalizeExpansion, EQUIPMENT };

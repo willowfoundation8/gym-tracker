@@ -163,12 +163,34 @@ export async function getModalityMap() {
   rows.forEach((r) => { map[r.key] = r.modality; });
   return map;
 }
+
+// Full rows, not just the modality — the table also carries `family` and
+// `equipment`. getModalityMap flattens those away, so anything needing them
+// (the similar-exercise hint) reads through here instead.
+export async function getExerciseMeta() {
+  const rows = await db.modalities.toArray();
+  const map  = {};
+  rows.forEach((r) => { map[r.key] = r; });
+  return map;
+}
+
+// entries: [{ name, modality, family?, equipment? }]
 export async function learnModality(entries) {
-  // entries: [{ name: string, modality: string }]
   const rows = entries
-    .map(({ name, modality }) => ({ key: nameKey(name), modality }))
+    .map(({ name, modality, family, equipment }) => ({ key: nameKey(name), modality, family, equipment }))
     .filter((r) => r.key && r.modality);
-  if (rows.length) await db.modalities.bulkPut(rows);
+  if (!rows.length) return;
+  // Read-merge-write, NOT a bare bulkPut. bulkPut replaces the whole record,
+  // so writing {key, modality} would erase family/equipment on every single
+  // workout save — the fields would appear to work and then quietly vanish.
+  const existing = await db.modalities.bulkGet(rows.map((r) => r.key));
+  await db.modalities.bulkPut(rows.map((r, i) => ({
+    ...(existing[i] || {}),
+    key: r.key,
+    modality: r.modality,
+    ...(r.family    ? { family: r.family }       : {}),
+    ...(r.equipment ? { equipment: r.equipment } : {}),
+  })));
 }
 
 /* ===========================================================================

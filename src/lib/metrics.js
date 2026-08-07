@@ -97,6 +97,55 @@ function fmtAgo(date) {
   return months <= 1 ? 'last month' : `${months} months ago`;
 }
 
+// A reference set from a RELATED exercise, for something you've never done.
+//
+// Deliberately narrow. It returns nothing the moment you have any history of
+// your own for this movement: two sessions of your own numbers beat any
+// analogy, and a stale hint next to real data is just noise.
+//
+// Returns the set verbatim — no e1RM, no barbell-to-dumbbell conversion.
+// Those ratios are gym folklore rather than anything with a defensible
+// constant, and a computed number would read as a prescription at the exact
+// moment someone is loading a bar for a movement they've never performed.
+// The reference alone is the anchor; the lifter picks the number.
+function findSimilarReference(workouts, meta, exerciseName, modality, excludeId) {
+  const key = nameKey(exerciseName);
+  const self = meta?.[key];
+  if (!self?.family) return null;
+  if (lastSession(workouts, exerciseName, excludeId)) return null;   // you have your own
+
+  const candidates = [];
+  for (const w of workouts) {
+    if (excludeId && w.id === excludeId) continue;
+    for (const e of (w.exercises || [])) {
+      const k = nameKey(e.name);
+      if (k === key) continue;
+      const m = meta[k];
+      if (!m?.family || m.family !== self.family) continue;
+      // Different equipment is the point — a dumbbell press informs a barbell
+      // press. Same family AND same equipment is just the same exercise under
+      // another name, which tells you nothing new.
+      if (self.equipment && m.equipment && m.equipment === self.equipment) continue;
+      // A distance record has nothing useful to say to a strength one.
+      if ((e.modality || 'strength') !== modality) continue;
+      const sets = (e.sets || []).filter((s) => s &&
+        (s.weight != null || s.reps != null || s.distance != null || s.seconds != null));
+      if (!sets.length) continue;
+      candidates.push({ name: e.name, date: w.date, modality: e.modality || 'strength', sets });
+    }
+  }
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => new Date(b.date) - new Date(a.date));   // most recent wins
+  const pick = candidates[0];
+  const best = pick.sets.slice().sort((a, b) =>
+    (b.weight || 0) - (a.weight || 0) ||
+    (b.reps || 0) - (a.reps || 0) ||
+    (b.distance || 0) - (a.distance || 0) ||
+    (b.seconds || 0) - (a.seconds || 0))[0];
+  return { name: pick.name, date: pick.date, modality: pick.modality, set: best };
+}
+
 function fmtStatVal(v, kind) {
   if (kind === 'sec') return fmtSeconds(Math.round(v));
   if (kind === 'm')   return fmtDist(v);
@@ -233,4 +282,4 @@ const CHART_CONFIG = {
   cardio:          { primary: 'effort',      primaryLabel: 'Effort score', primaryUnit: '',   secondary: 'totalDist',    secondaryLabel: 'Distance (m)',   secondaryUnit: 'm',  note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },
 };
 
-export { epley, exerciseStats, fmtStatVal, computeProgressData, CHART_CONFIG, lastSession, fmtSetSummary, fmtAgo };
+export { epley, exerciseStats, fmtStatVal, computeProgressData, CHART_CONFIG, lastSession, fmtSetSummary, fmtAgo, findSimilarReference };
