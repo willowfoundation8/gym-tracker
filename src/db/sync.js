@@ -7,7 +7,7 @@
 
 import { supabase, getSession } from './supabase';
 import {
-  db, getDirtyWorkouts, afterPush, markAllDirty,
+  db, getDirtyWorkouts, afterPush, markAllDirty, getOfflineDeletes,
   getMeta, setMeta, getOwner, setOwner, logEvent,
 } from './local';
 
@@ -43,6 +43,16 @@ async function doSync(reason) {
   }
   if (!owner) await setOwner(userId);
 
+  // Deletions made while signed out are held until the user decides. Blocking
+  // the whole sync rather than pushing the additions and holding the deletes
+  // keeps it comprehensible: one question, one resolution, then everything
+  // moves together.
+  const offlineDeletes = await getOfflineDeletes();
+  if (offlineDeletes.length) {
+    logEvent('warn', 'sync_needs_delete_confirm', `${offlineDeletes.length} deleted while signed out`);
+    return { ok: false, needsDeleteConfirm: offlineDeletes.length };
+  }
+
   try {
     const pushed = await pushLocal(userId);
     const pulled = await pullRemote();
@@ -76,7 +86,14 @@ async function pushLocal(userId) {
       deleted:    !!w.deleted,
       data:       w,
     }));
-    const { error } = await supabase.from('workouts').upsert(rows, { onConflict: 'id' });
+    // Keyed on (user_id, id), not id alone. A globally-unique id means two
+    // accounts can never hold the same workout id — so a device that pushed
+    // under one account and later signs in as another collides on a row it
+    // cannot see, Postgres takes the ON CONFLICT DO UPDATE path, and the
+    // UPDATE policy's USING correctly refuses. One collision fails the whole
+    // batch and sync stops dead with a 403. abbrevs and modalities were
+    // already keyed this way; workouts was the odd one out.
+    const { error } = await supabase.from('workouts').upsert(rows, { onConflict: 'user_id,id' });
     if (error) throw error;
     await afterPush(dirty.map((w) => ({ id: w.id, deleted: !!w.deleted })));
   }
@@ -170,8 +187,9 @@ async function pullLearnedCaches() {
 }
 
 export async function getSyncState() {
-  const [session, lastPushedAt, lastPulledAt, dirty, owner] = await Promise.all([
-    getSession(), getMeta(LAST_PUSHED_KEY), getMeta(LAST_PULLED_KEY), getDirtyWorkouts(), getOwner(),
+  const [session, lastPushedAt, lastPulledAt, dirty, owner, offlineDeletes] = await Promise.all([
+    getSession(), getMeta(LAST_PUSHED_KEY), getMeta(LAST_PULLED_KEY),
+    getDirtyWorkouts(), getOwner(), getOfflineDeletes(),
   ]);
   const userId = session?.user?.id || null;
   return {
@@ -180,5 +198,6 @@ export async function getSyncState() {
     lastPulledAt,
     pending: dirty.length,
     wrongAccount: !!(owner && userId && owner !== userId),
+    offlineDeletes: offlineDeletes.length,
   };
 }

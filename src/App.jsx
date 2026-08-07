@@ -9,6 +9,7 @@ import {
   exportAll, importAll, exportCSV, logEvent, getLogs, clearLogs,
   getSession, onAuthChange, signInGoogle, signOut,
   syncNow, getSyncState, resetLocalData,
+  confirmOfflineDeletes, restoreOfflineDeletes,
 } from './db';
 import { uid, withRetry, fmtSeconds } from './lib/helpers';
 import {
@@ -94,6 +95,17 @@ export default function App() {
     await refresh();          // a pull may have changed what's on screen
     await refreshSync();
     setAuthErr(r.ok || r.skipped || r.blocked ? null : 'Sync failed: ' + (r.error || 'unknown error'));
+  }
+
+  async function onConfirmDeletes() {
+    await confirmOfflineDeletes();
+    await refresh(); await refreshSync();
+    triggerSync('deletes_confirmed');
+  }
+  async function onKeepDeletes() {
+    await restoreOfflineDeletes();
+    await refresh(); await refreshSync();
+    triggerSync('deletes_restored');
   }
 
   // Account switch: this device's data belongs to someone else. Destructive,
@@ -259,7 +271,14 @@ export default function App() {
       setScreen('edit');
     }
   }
-  async function remove(id) { await deleteWorkout(id); setConfirmId(null); await refresh(); triggerSync('delete'); }
+  // Pass whether we're signed in: a delete made while signed out is tagged and
+  // held for confirmation rather than silently removing it from the account.
+  async function remove(id) {
+    await deleteWorkout(id, !!session);
+    setConfirmId(null);
+    await refresh(); await refreshSync();
+    triggerSync('delete');
+  }
   // First tap arms the delete; second tap (within 3s) performs it.
   function askRemove(ev, id) {
     ev.stopPropagation();
@@ -481,6 +500,15 @@ export default function App() {
                     style={{ ...S.dataBtn, width: '100%', marginTop: 10, ...(resetArmed ? { color: '#ff5a6e', borderColor: '#5a2330' } : {}) }}
                     onClick={onResetLocal}
                   >{resetArmed ? 'Tap again — this erases local workouts' : '⬇ Back up & clear this device'}</button>
+                </div>
+              ) : syncState.offlineDeletes > 0 ? (
+                <div style={S.guessBanner}>
+                  You deleted {syncState.offlineDeletes} workout{syncState.offlineDeletes === 1 ? '' : 's'} on this device while signed out.
+                  Remove {syncState.offlineDeletes === 1 ? 'it' : 'them'} from your account too, or keep {syncState.offlineDeletes === 1 ? 'it' : 'them'}?
+                  <div style={{ ...S.dataRow, marginTop: 10 }}>
+                    <button style={S.dataBtn} onClick={onKeepDeletes}>Keep</button>
+                    <button style={{ ...S.dataBtn, color: '#ff5a6e' }} onClick={onConfirmDeletes}>Remove from account</button>
+                  </div>
                 </div>
               ) : (
                 <>

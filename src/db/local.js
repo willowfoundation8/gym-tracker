@@ -96,10 +96,21 @@ export async function saveWorkout(w) {
 // devices. sync.js hard-deletes it locally once the tombstone is pushed.
 // A workout that was never saved to the cloud still goes through the same
 // path — the tombstone is cheap and the flow stays uniform.
-export async function deleteWorkout(id) {
+// `wasSignedIn` distinguishes a normal delete (sync it, even if offline right
+// now) from one made while signed out. Signing out says "keeps local data",
+// which reads as local scratch space — so deletions made in that state must
+// not silently remove workouts from the account on next sign-in. They are
+// tagged and held for confirmation instead.
+export async function deleteWorkout(id, wasSignedIn = true) {
   const existing = await db.workouts.get(id);
   if (!existing) return;
-  await db.workouts.put({ ...existing, deleted: 1, dirty: 1, updatedAt: now() });
+  await db.workouts.put({
+    ...existing,
+    deleted: 1,
+    dirty: 1,
+    offlineDelete: wasSignedIn ? 0 : 1,
+    updatedAt: now(),
+  });
 }
 
 // ── Exercise rollups ─────────────────────────────────────────────────────────
@@ -241,6 +252,35 @@ export async function setMeta(key, value) {
 // Rows awaiting push. Matches on the numeric index — see the v4 schema note.
 export async function getDirtyWorkouts() {
   return db.workouts.where('dirty').equals(1).toArray();
+}
+
+// Deletions made while signed out, awaiting a decision. Held back from push
+// until the user says whether they meant to remove them from the account too.
+export async function getOfflineDeletes() {
+  const dirty = await db.workouts.where('dirty').equals(1).toArray();
+  return dirty.filter((w) => w.deleted && w.offlineDelete);
+}
+
+// "Yes, remove them from my account" — demote to ordinary tombstones so the
+// next push carries them up as deletions.
+export async function confirmOfflineDeletes() {
+  const rows = await getOfflineDeletes();
+  if (rows.length) await db.workouts.bulkPut(rows.map((w) => ({ ...w, offlineDelete: 0 })));
+  logEvent('info', 'offline_deletes_confirmed', `${rows.length} removed from account`);
+  return rows.length;
+}
+
+// "No, keep them" — un-delete locally. Leaving them deleted here but alive in
+// the cloud would be incoherent: the next pull would simply bring them back.
+export async function restoreOfflineDeletes() {
+  const rows = await getOfflineDeletes();
+  if (rows.length) {
+    await db.workouts.bulkPut(rows.map((w) => ({
+      ...w, deleted: 0, offlineDelete: 0, dirty: 1, updatedAt: now(),
+    })));
+  }
+  logEvent('info', 'offline_deletes_restored', `${rows.length} kept`);
+  return rows.length;
 }
 
 // Which account this device's data belongs to. Local rows carry no user_id of
