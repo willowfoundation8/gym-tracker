@@ -42,6 +42,61 @@ function exerciseStats(workouts, exerciseName, modality, excludeId) {
   return { sessions, avg, max, kind };
 }
 
+// The most recent session containing this exercise. An exercise can appear
+// more than once in a workout (warmup + working sets as separate entries), so
+// every instance's sets are merged. excludeId skips the workout being edited
+// so it can never suggest itself back.
+//
+// Deliberately separate from exerciseStats: that answers "how am I trending"
+// with averages and bests; this answers "what do I load today", which is the
+// only question that matters while standing at the rack.
+function lastSession(workouts, exerciseName, excludeId) {
+  const key = nameKey(exerciseName);
+  if (!key) return null;
+  let best = null;
+  for (const w of workouts) {
+    if (excludeId && w.id === excludeId) continue;
+    const matched = (w.exercises || []).filter((e) => nameKey(e.name) === key);
+    if (!matched.length) continue;
+    if (!best || new Date(w.date) > new Date(best.date)) {
+      best = {
+        date: w.date,
+        modality: matched[0].modality || 'strength',
+        sets: matched.flatMap((e) => e.sets || []),
+      };
+    }
+  }
+  return best;
+}
+
+// One set, in the units it was logged in — no conversion. This is a reminder
+// of what you actually did, so it should read exactly as you entered it.
+function fmtSetSummary(s, modality) {
+  const wu = s.weightUnit || 'kg';
+  const du = s.distUnit || 'm';
+  switch (modality) {
+    case 'bodyweight':      return s.weight ? `${s.reps} × ${s.weight}${wu}` : `${s.reps} reps`;
+    case 'distance':        return s.seconds ? `${s.distance}${du} in ${fmtSeconds(s.seconds)}` : `${s.distance}${du}`;
+    case 'loaded_distance': return `${s.weight}${wu} × ${s.distance}${du}`;
+    case 'duration':        return fmtSeconds(s.seconds);
+    case 'cardio':          return `${s.distance}${du} in ${fmtSeconds(s.seconds)}`;
+    default:                return `${s.weight}${wu} × ${s.reps}`;   // strength
+  }
+}
+
+// "3 weeks ago" reads better than a date here — the gap is the useful part,
+// not the calendar position.
+function fmtAgo(date) {
+  const days = Math.floor((Date.now() - new Date(date)) / 86400000);
+  if (days <= 0)  return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 7)   return `${days} days ago`;
+  const weeks = Math.round(days / 7);
+  if (weeks < 5)  return weeks === 1 ? 'last week' : `${weeks} weeks ago`;
+  const months = Math.round(days / 30);
+  return months <= 1 ? 'last month' : `${months} months ago`;
+}
+
 function fmtStatVal(v, kind) {
   if (kind === 'sec') return fmtSeconds(Math.round(v));
   if (kind === 'm')   return fmtDist(v);
@@ -178,4 +233,4 @@ const CHART_CONFIG = {
   cardio:          { primary: 'effort',      primaryLabel: 'Effort score', primaryUnit: '',   secondary: 'totalDist',    secondaryLabel: 'Distance (m)',   secondaryUnit: 'm',  note: 'Effort = (distance ÷ time) × (1 + resistance ÷ 20). Rewards going harder at higher resistance.' },
 };
 
-export { epley, exerciseStats, fmtStatVal, computeProgressData, CHART_CONFIG };
+export { epley, exerciseStats, fmtStatVal, computeProgressData, CHART_CONFIG, lastSession, fmtSetSummary, fmtAgo };

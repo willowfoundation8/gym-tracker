@@ -17,7 +17,11 @@ import {
   bodyRegion, emptySet, nextModality, isSledType, seedModality,
 } from './lib/modality';
 import { fileToImage, extractExercises, resolveNames } from './lib/vision';
-import { computeProgressData, exerciseStats, fmtStatVal, CHART_CONFIG } from './lib/metrics';
+import {
+  computeProgressData, exerciseStats, fmtStatVal, CHART_CONFIG,
+  lastSession, fmtSetSummary, fmtAgo,
+} from './lib/metrics';
+import { ExerciseNameInput } from './components/ExerciseNameInput';
 import {
   SetRowStrength, SetRowBodyweight, SetRowDistance,
   SetRowLoadedDistance, SetRowDuration, SetRowCardio, SET_HEADERS,
@@ -222,6 +226,38 @@ export default function App() {
   // Any meaningful logged/seeded value (defaults like units and resistance:5 don't count)
   const setHasData = (s) =>
     s.reps != null || s.weight != null || s.distance != null || s.seconds != null || s.height != null;
+
+  // Picking a known name resolves the exercise's SHAPE — modality and units —
+  // which manual entry never did before: it hardcoded 'strength', so typing
+  // "Run" silently gave you reps and weight instead of distance and time.
+  // Only reshapes while the sets are still empty; never rewrites entered data.
+  function pickExerciseName(i, name) {
+    const ex = draft.exercises[i];
+    const patch = { name, guessed: false, status: 'confirmed' };
+    if (!ex.sets.some(setHasData)) {
+      const mod = seedModality(name) || modalityByKey[nameKey(name)] || ex.modality;
+      if (mod !== ex.modality) {
+        const ref = lastSession(workouts, name, draft.id)?.sets?.at(-1);
+        patch.modality = mod;
+        patch.sets = ex.sets.map(() => emptySet(mod, ref));
+      }
+    }
+    updateExercise(i, patch);
+  }
+
+  // Fill this exercise with last session's sets. Nothing is written until the
+  // user taps — the line is a reminder first and a shortcut second.
+  function applyLastSession(i, last) {
+    const ex = draft.exercises[i];
+    if (ex.sets.some(setHasData) &&
+        !window.confirm("Replace the sets you've entered with last session's?")) {
+      return;
+    }
+    updateExercise(i, {
+      modality: last.modality,
+      sets: last.sets.filter(setHasData).map((s) => ({ ...s, id: uid() })),
+    });
+  }
 
   function cycleModality(i) {
     const ex  = draft.exercises[i];
@@ -607,9 +643,13 @@ export default function App() {
             return (
               <div key={ex.id || i} style={S.card}>
                 <div style={S.cardHead}>
-                  <input style={{ ...S.exName, ...(ex.guessed ? S.exNameGuess : {}) }}
-                    placeholder="Exercise name" value={ex.name}
-                    onChange={(e) => updateExercise(i, { name: e.target.value, guessed: false, status: 'confirmed' })} />
+                  <ExerciseNameInput
+                    value={ex.name}
+                    names={names}
+                    guessed={ex.guessed}
+                    onChange={(v) => updateExercise(i, { name: v, guessed: false, status: 'confirmed' })}
+                    onPick={(n) => pickExerciseName(i, n)}
+                  />
                   {ex.guessed && <button style={S.confirmBtn} onClick={() => updateExercise(i, { guessed: false, status: 'confirmed' })}>✓</button>}
                   <button style={S.del} onClick={() => removeExercise(i)}>✕</button>
                 </div>
@@ -633,6 +673,24 @@ export default function App() {
                   return hist ? (
                     <div style={S.histTag}>📊 {hist.sessions} session{hist.sessions === 1 ? '' : 's'} — avg {fmtStatVal(hist.avg, hist.kind)} · best {fmtStatVal(hist.max, hist.kind)}</div>
                   ) : null;
+                })()}
+                {/* What you actually loaded last time. The stats line above
+                    answers "am I progressing"; this answers "what do I put on
+                    the bar", which is the question you have mid-workout. */}
+                {(() => {
+                  const last = lastSession(workouts, ex.name, draft.id);
+                  if (!last) return null;
+                  const done = last.sets.filter(setHasData);
+                  if (!done.length) return null;
+                  return (
+                    <div
+                      style={{ ...S.hintTag, cursor: 'pointer' }}
+                      onClick={() => applyLastSession(i, last)}
+                    >
+                      ⏱ Last time, {fmtAgo(last.date)} — {done.map((s) => fmtSetSummary(s, last.modality)).join(', ')}
+                      <span style={{ color: '#6b7080' }}> · tap to fill</span>
+                    </div>
+                  );
                 })()}
 
                 {/* Set headers. position:relative anchors the InfoTip popover
