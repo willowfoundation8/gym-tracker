@@ -36,11 +36,92 @@ The learned store handles gym-specific or unusual exercises after first
 confirmation. AI suggestion is the fallback for truly unknown entries, not the
 primary path. This hierarchy keeps the app fast and cheap at scale.
 
+**Verify a design doc against the code before implementing it**
+`CLOUD_SYNC_DESIGN.md` was written carefully and still contained two errors
+that would each have broken sync — one silently. It claimed "UI already filters
+`deleted` out of lists" when the string appeared nowhere in `src/`, and its
+schema indexed `dirty` while its prose set `dirty: true`. Both read as obviously
+correct. A design doc records intent at a moment in time; the code is what is
+actually true. Grep for the claim before building on it, and when they disagree,
+say so rather than quietly picking one.
+
 **Versioned schema migrations with Dexie**
 Use `db.version(N).stores({...})` for every schema change. Dexie handles the
 upgrade automatically on first load — existing user data is preserved. Never
 edit an existing version; always add a new one. Document what each version adds
 in a comment.
+
+---
+
+## Sync & Multi-Device
+
+**IndexedDB cannot index booleans — sync flags must be 1/0**
+A record with `dirty: true` is simply absent from the `dirty` index, and a
+boolean key lookup throws `DataError`. Had the flag been boolean,
+`where('dirty').equals(1)` would have matched nothing: sync would report
+success while uploading nothing, forever, with no error anywhere. Store `1`/`0`
+for anything indexed, and convert to real booleans at the Postgres boundary.
+The failure mode here is silence, which is the worst kind.
+
+**A per-user table needs a per-user primary key**
+`workouts.id uuid primary key` makes an id unique across *all* users. A device
+that pushed under one account and later signed in as another re-pushed the same
+ids, Postgres took the `ON CONFLICT DO UPDATE` path, and RLS refused with a 403
+— the caller could not even see the row blocking it, because the SELECT policy
+hid it. One collision failed the whole batch and sync stopped dead. The key is
+`(user_id, id)`. Telling detail: `abbrevs` and `modalities` were already keyed
+`(user_id, key)` and never had the problem, so the flaw was an inconsistency in
+the schema rather than a considered choice.
+
+**RLS was right; the schema was asking it to do something impossible**
+Worth remembering when a security control appears to misfire. The instinct is
+to loosen the policy. The policy was correct — it refused to let one account
+overwrite another's row, exactly as designed. The bug was upstream.
+
+**Local rows have no owner, so the client can attribute them to the wrong user**
+Workouts live in IndexedDB with no `user_id`; a push stamps whoever is signed
+in. Sign in on a device holding someone else's workouts and they upload under
+your account — RLS storing the wrong attribution faithfully, because the client
+asked it to. `meta.ownerUserId` records the owning account and blocks sync on a
+mismatch. Note this only protects devices that sync *after* the gate exists; it
+cannot know who owned a device that synced before it.
+
+**Signing out is not a sandbox — say what happens to changes made there**
+"Signing out keeps local data" reads as *this is now local scratch space*.
+Deleting workouts in that state created ordinary tombstones, and the next
+sign-in pushed them: two real workouts lost while tidying up what looked like
+leftovers. Deletions now record whether the user was signed in, and ones made
+signed out block sync until answered. Additions and edits still sync silently —
+only the destructive direction asks. The general rule: any state where a user
+believes they are working locally needs an explicit decision before those
+changes propagate.
+
+**Sync watermarks use the server clock, never the device clock**
+`lastPulledAt` is the maximum `updated_at` actually returned by the server, not
+`Date.now()`. A device with a fast clock would otherwise set the watermark into
+the future and permanently skip every row written in the gap. Anything
+comparing timestamps across machines has to agree whose clock counts.
+
+**Local edits win over pulls, but "last write" means last device to sync**
+A pull must never revert an edit just made on the device, so dirty rows are
+skipped during merge. The honest limitation is that the push overwrites
+unconditionally without comparing timestamps — so if the same workout changes
+in two places, the winner is whoever syncs last, not whoever edited last.
+Acceptable for one person with one phone; name it rather than let "LWW merge"
+imply a stronger guarantee than it delivers.
+
+**Tombstones are a backup of last resort**
+A soft delete pushed to Postgres sets `deleted = true` and leaves the full
+record in the `data` column. When the deletion incident above wiped two
+workouts, they were recoverable with a single `update … set deleted = false`.
+Hard-deleting server-side would have made that unrecoverable.
+
+**Test row-level security with two accounts, and never from the SQL editor**
+The SQL editor runs as superuser and bypasses RLS entirely, so it cannot prove
+isolation. With one account you also cannot distinguish "RLS works" from "RLS
+is off" — every row is yours either way. The only honest check is a query
+through the anon key and a real session, from two different accounts,
+confirming each sees exactly one distinct `user_id`.
 
 ---
 
@@ -56,6 +137,23 @@ guessing. Remove it once the issue is resolved, but don't hesitate to add it.
 The model string `claude-sonnet-4-20250514` was retired without warning mid-
 deployment. Store the model string in one place (the proxy function) so it's
 one edit to update. Never hardcode it in multiple locations.
+
+**A model upgrade is rarely just a model-string swap**
+Moving the proxies from Sonnet 4.6 to Sonnet 5 changed two things silently.
+Adaptive thinking became *on* by default when the `thinking` parameter is
+omitted, and `max_tokens` caps thinking plus response text together — so the
+board parse would have started truncating JSON mid-array, surfacing as the
+existing `vision_truncated` path and looking like a regression in board
+reading rather than a model change. The tokenizer also emits roughly 30% more
+tokens for the same text. Read the migration notes for the specific version
+before swapping the string, and give `max_tokens` headroom.
+
+**Set `effort` explicitly on models that think by default**
+The board parse runs while the user is standing in a gym waiting. Left at the
+default, adaptive thinking runs at `high` effort on every call. `medium` for
+the vision parse and `low` for shorthand expansion keeps latency sane —
+observed `thinking_tokens: 0` on trivial expansions, which is the model
+correctly spending nothing.
 
 **`anthropic-version` is the API spec version, not the model version**
 `2023-06-01` is correct and stable — it applies to all current models and does
@@ -179,6 +277,23 @@ Without CLI access, entering `functions/api/vision.js` as the filename in the
 GitHub web editor auto-creates the nested directory. No need for a terminal to
 scaffold the folder structure.
 
+**Never commit `node_modules` — and the phone-only workflow makes it easy to**
+The repo tracked 5,063 files, of which 5,041 were dependency code that
+`npm install` regenerates from `package.json`. It happened because the GitHub
+web editor has no `.gitignore` step and nothing warns you. It only became
+urgent when adding a dependency: installing `@supabase/supabase-js` would have
+buried four files of real code under hundreds of vendor files. `git rm -r
+--cached` untracks without touching the disk — verify the app still builds
+afterwards. Note this stops future growth but does not shrink history; purging
+old blobs means rewriting history, which is not worth it on a repo that
+deploys from `main` on every push.
+
+**A source-identical commit cannot be verified by fetching the site**
+The gitignore cleanup changed no source, so a successful build produced a
+byte-identical bundle — and a *failed* build leaves the previous deployment
+serving. Both look the same from outside. When a change can't alter the
+output, the Deployments tab is the only signal.
+
 **Environment variables require a redeploy to take effect on Cloudflare Pages**
 Setting a secret in the Cloudflare dashboard does not hot-reload the running
 deployment. Always trigger a new deploy after adding or changing secrets.
@@ -191,6 +306,21 @@ deployment. Always trigger a new deploy after adding or changing secrets.
 PRs and streaks are valuable but they're a layer on top of clean logging. Get
 logging solid first; the stats fall out easily afterward. Every deferred feature
 is a decision, not an oversight.
+
+**Say plainly what was not verified**
+Sign-in could be driven as far as Google's consent screen and no further —
+typing credentials is off-limits — so the redirect construction was proven and
+the round trip was not. The same applied to RLS, which needed two real
+accounts. Commit messages and hand-offs name these gaps explicitly. "Verified"
+covering work that was only reasoned about is how a silent failure reaches a
+phone.
+
+**Verify a risky migration by reconstructing the old state**
+Rather than assume the Dexie v3 → v4 upgrade preserved data, the test rebuilt a
+v3 database by hand, inserted a legacy-shaped workout with no sync flags, and
+loaded the app. The record survived intact with the new index and table added
+alongside. On a database holding real training history, "additive migrations
+are safe in principle" is not the same as having watched one run.
 
 **Design the migration path before you need it**
 The cloud sync upgrade (Supabase/Firebase) was identified as the next major
